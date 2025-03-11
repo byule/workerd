@@ -1331,6 +1331,7 @@ async function test(state) {
     const rowChangeEvents = [];
 
     // Set up the row change hook
+    // This specifically tests our new setRowChangeHook API (different from setUpdateHook)
     sql.setRowChangeHook((operation, table, rowid) => {
       console.log('ROW CHANGE HOOK CALLED:', { operation, table, rowid });
       // Record the event
@@ -1384,7 +1385,10 @@ async function test(state) {
     // Test DELETE operation
     sql.exec('DELETE FROM row_change_test WHERE rowid = ?', insertedRowId2);
 
-    // Clear the row change hook
+    // Test the clearRowChangeHook API - save the event count before clearing
+    const eventCountBeforeClearing = rowChangeEvents.length;
+
+    // Clear the row change hook using our new API
     sql.clearRowChangeHook();
 
     // This operation should not trigger the hook since we cleared it
@@ -1393,6 +1397,13 @@ async function test(state) {
       'not-tracked',
       400,
       new Date().toISOString()
+    );
+
+    // Verify that clearRowChangeHook worked by checking that no new events were recorded
+    assert.equal(
+      rowChangeEvents.length,
+      eventCountBeforeClearing,
+      'No new events should be recorded after clearing the hook'
     );
 
     // Validate the events
