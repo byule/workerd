@@ -8,6 +8,15 @@ import { DurableObject } from 'cloudflare:workers';
 async function test(state) {
   const storage = state.storage;
   const sql = storage.sql;
+
+  // Track if the workerdExperimental flag is enabled by trying to access an experimental API
+  let hasExperimental = false;
+  try {
+    hasExperimental = typeof sql.prepare === 'function';
+  } catch (e) {
+    // Experimental flag is not enabled
+    hasExperimental = false;
+  }
   // Test numeric results
   const resultNumber = [...sql.exec('SELECT 123')];
   assert.equal(resultNumber.length, 1);
@@ -1086,6 +1095,107 @@ async function test(state) {
       { a: 2, b: 2 },
       { a: 3, b: 3 },
     ]);
+  }
+
+  // Test update hook if experimental flag is enabled
+  if (hasExperimental) {
+    // Create test table
+    sql.exec(
+      'CREATE TABLE IF NOT EXISTS update_hook_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)'
+    );
+
+    // Track update events
+    const updateEvents = [];
+
+    // Set update hook
+    sql.setUpdateHook((operation, database, table, rowid) => {
+      console.log('UPDATE HOOK CALLED:', { operation, database, table, rowid });
+      updateEvents.push({ operation, database, table, rowid });
+    });
+
+    // INSERT operation (should trigger hook)
+    sql.exec(
+      'INSERT INTO update_hook_test (name, value) VALUES (?, ?)',
+      'test1',
+      100
+    );
+
+    // UPDATE operation (should trigger hook)
+    sql.exec(
+      'UPDATE update_hook_test SET value = ? WHERE name = ?',
+      200,
+      'test1'
+    );
+
+    // DELETE operation (should trigger hook)
+    sql.exec('DELETE FROM update_hook_test WHERE name = ?', 'test1');
+
+    // Add a small delay to ensure all update hooks have executed
+    await scheduler.wait(100);
+
+    // Verify we got 3 events (INSERT, UPDATE, DELETE)
+    console.log('Event count:', updateEvents.length);
+    for (const event of updateEvents) {
+      console.log(event);
+    }
+    assert.equal(
+      updateEvents.length,
+      3,
+      'Update hook should have been called 3 times'
+    );
+
+    // Verify the INSERT event
+    assert.equal(
+      updateEvents[0].operation,
+      18,
+      'First operation should be INSERT (18)'
+    );
+    assert.equal(
+      updateEvents[0].table,
+      'update_hook_test',
+      'Table name should be update_hook_test'
+    );
+
+    // Verify the UPDATE event
+    assert.equal(
+      updateEvents[1].operation,
+      23,
+      'Second operation should be UPDATE (23)'
+    );
+    assert.equal(
+      updateEvents[1].table,
+      'update_hook_test',
+      'Table name should be update_hook_test'
+    );
+
+    // Verify the DELETE event
+    assert.equal(
+      updateEvents[2].operation,
+      9,
+      'Third operation should be DELETE (9)'
+    );
+    assert.equal(
+      updateEvents[2].table,
+      'update_hook_test',
+      'Table name should be update_hook_test'
+    );
+
+    // Clear the update hook
+    sql.clearUpdateHook();
+
+    // This shouldn't trigger any events since we cleared the hook
+    sql.exec(
+      'INSERT INTO update_hook_test (name, value) VALUES (?, ?)',
+      'test2',
+      300
+    );
+
+    // Verify no additional events were captured
+    assert.equal(
+      updateEvents.length,
+      3,
+      'No new events should be captured after clearing the hook'
+    );
   }
 }
 

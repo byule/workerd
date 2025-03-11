@@ -90,6 +90,67 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   return pages * getPageSize(db);
 }
 
+void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback) {
+  // Store the JavaScript callback function
+  updateHookCallback = kj::mv(callback);
+
+  // Get the SQLite database
+  auto& db = getDb(js);
+
+  // We need to capture 'this' to access the callback later
+  SqlStorage* self = this;
+
+  // Set the update hook with a regular function
+  db.setUpdateHook(SqliteDatabase::UpdateHookCallback(
+      [self](int op, kj::StringPtr database, kj::StringPtr table, int64_t rowid) {
+    // Get current IoContext within the hook function
+    auto& context = IoContext::current();
+
+    // Create copies of the strings since they are references that won't survive the lambda
+    auto dbCopy = kj::str(database);
+    auto tableCopy = kj::str(table);
+
+    // The JavaScript callback will be accessed inside context.run()
+    context
+        .run([self, op, database = kj::mv(dbCopy), table = kj::mv(tableCopy), rowid](
+                 jsg::Lock& js) mutable -> kj::Promise<void> {
+      // Try to get the callback from self
+      KJ_IF_SOME(callback, self->updateHookCallback) {
+        // Make a copy of the callback for use in this function scope
+        auto callbackCopy = callback.addRef(js);
+
+        // Build the arguments for the JavaScript callback
+        v8::Local<v8::Value> args[4] = {
+          js.num(op),                         // operation type
+          js.str(database),                   // database name
+          js.str(table),                      // table name
+          js.num(static_cast<double>(rowid))  // rowid as double
+        };
+
+        // Call the JavaScript callback with the arguments
+        auto handle = callbackCopy.getHandle(js);
+        auto undefined = v8::Undefined(js.v8Isolate);
+        handle->Call(js.v8Context(), undefined, 4, args).ToLocalChecked();
+      }
+
+      return kj::READY_NOW;
+    }).detach([](kj::Exception&& e) {
+      // Just log any errors that occur in the hook callback
+      IoContext::current().logUncaughtExceptionAsync(
+          UncaughtExceptionSource::ASYNC_TASK, kj::mv(e));
+    });
+  }));
+}
+
+void SqlStorage::clearUpdateHook(jsg::Lock& js) {
+  // Clear the JavaScript callback
+  updateHookCallback = kj::none;
+
+  // Clear the SQLite update hook
+  auto& db = getDb(js);
+  db.setUpdateHook(kj::none);
+}
+
 bool SqlStorage::isAllowedName(kj::StringPtr name) const {
   return !name.startsWith("_cf_");
 }
@@ -387,6 +448,7 @@ void SqlStorage::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
     tracker.trackFieldWithSize(
         "IoPtr<SqllitDatabase::Statement>", sizeof(IoPtr<SqliteDatabase::Statement>));
   }
+  tracker.trackField("updateHookCallback", updateHookCallback);
 }
 
 }  // namespace workerd::api

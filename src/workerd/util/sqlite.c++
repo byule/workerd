@@ -1231,6 +1231,35 @@ void SqliteDatabase::setupSecurity(sqlite3* db) {
   // (handled in BUILD.sqlite3)
 }
 
+void SqliteDatabase::setUpdateHook(kj::Maybe<UpdateHookCallback> callback) {
+  // Get the sqlite3 database handle, checking if it's valid
+  sqlite3& dbRef = KJ_ASSERT_NONNULL(maybeDb, "database not opened or previous reset() failed");
+  sqlite3* db = &dbRef;
+
+  if (callback != kj::none) {
+    // Store the callback
+    updateHookCallback = kj::mv(callback);
+
+    // Set the SQLite update hook
+    sqlite3_update_hook(db,
+        [](void* userData, int operation, const char* dbName, const char* tableName,
+            sqlite3_int64 rowid) {
+      auto& db = *static_cast<SqliteDatabase*>(userData);
+      KJ_IF_SOME(callback, db.updateHookCallback) {
+        // Call the user's callback with the operation details
+        callback(operation, dbName, tableName, rowid);
+      }
+    },
+        this);
+  } else {
+    // Clear our stored callback
+    updateHookCallback = kj::none;
+
+    // Unregister the SQLite update hook
+    sqlite3_update_hook(db, nullptr, nullptr);
+  }
+}
+
 SqliteDatabase::Statement SqliteDatabase::prepare(
     const Regulator& regulator, kj::StringPtr sqlCode) {
   return Statement(
