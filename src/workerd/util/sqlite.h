@@ -258,20 +258,34 @@ class SqliteDatabase {
     }
   }
 
+  // Operation type for update hook callbacks (more readable than SQLite's numeric constants)
+  enum class UpdateOperation { INSERT, UPDATE, DELETE };
+
   // Function type for update hook callbacks
-  // The parameters match SQLite's update hook callback function:
-  // - op: The operation type (SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE)
-  // - database: The database name
+  // - operation: The operation type (INSERT, UPDATE, DELETE)
   // - table: The table name
   // - rowid: The rowid of the affected row
   using UpdateHookCallback =
-      kj::Function<void(int op, kj::StringPtr database, kj::StringPtr table, int64_t rowid)>;
+      kj::Function<void(UpdateOperation operation, kj::StringPtr table, int64_t rowid)>;
 
   // Set a callback that will be invoked whenever a row is inserted, updated, or deleted.
-  // The callback receives information about what operation occurred, the database and table names,
-  // and the rowid of the affected row.
-  // Passing nullptr as callback will unregister any previously registered callback.
+  // The callback receives information about what operation occurred (INSERT, UPDATE, DELETE),
+  // the table name, and the rowid of the affected row.
+  // Pass kj::none to unregister any previously registered callback.
   void setUpdateHook(kj::Maybe<UpdateHookCallback> callback);
+
+  // Function type for row change hook callbacks
+  // - operation: The operation type (INSERT, UPDATE, DELETE)
+  // - table: The table name
+  // - rowid: The rowid of the affected row
+  using RowChangeHookCallback =
+      kj::Function<void(UpdateOperation operation, kj::StringPtr table, int64_t rowid)>;
+
+  // Set a callback that will be invoked when a row is inserted, updated, or deleted.
+  // The callback receives information about what operation occurred (INSERT, UPDATE, DELETE),
+  // the table name, and the rowid of the affected row.
+  // Pass kj::none to unregister any previously registered callback.
+  void setRowChangeHook(kj::Maybe<RowChangeHookCallback> callback);
 
  private:
   const Vfs& vfs;
@@ -318,10 +332,8 @@ class SqliteDatabase {
   // The update hook callback, if registered
   kj::Maybe<UpdateHookCallback> updateHookCallback;
 
-  // SQLite operation constants for update hooks
-  static constexpr int SQLITE_INSERT = 18;
-  static constexpr int SQLITE_UPDATE = 23;
-  static constexpr int SQLITE_DELETE = 9;
+  // The row change hook callback, if registered
+  kj::Maybe<RowChangeHookCallback> rowChangeHookCallback;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
 

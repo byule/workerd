@@ -90,6 +90,8 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   return pages * getPageSize(db);
 }
 
+// The SqlStorage class implementation
+
 void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback) {
   // Store the JavaScript callback function
   updateHookCallback = kj::mv(callback);
@@ -97,49 +99,66 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
   // Get the SQLite database
   auto& db = getDb(js);
 
-  // We need to capture 'this' to access the callback later
-  SqlStorage* self = this;
-
-  // Set the update hook with a regular function
+  // Set the update hook with a direct callback that executes immediately
+  // We'll use the processingUpdateHooks flag to prevent re-entrancy
   db.setUpdateHook(SqliteDatabase::UpdateHookCallback(
-      [self](int op, kj::StringPtr database, kj::StringPtr table, int64_t rowid) {
-    // Get current IoContext within the hook function
-    auto& context = IoContext::current();
+      [this](SqliteDatabase::UpdateOperation op, kj::StringPtr table, int64_t rowid) {
+    // Skip if we're already processing hooks (prevent re-entrancy)
+    if (processingUpdateHooks) {
+      return;
+    }
 
-    // Create copies of the strings since they are references that won't survive the lambda
-    auto dbCopy = kj::str(database);
+    // Create a copy of the table name string
     auto tableCopy = kj::str(table);
 
-    // The JavaScript callback will be accessed inside context.run()
-    context
-        .run([self, op, database = kj::mv(dbCopy), table = kj::mv(tableCopy), rowid](
-                 jsg::Lock& js) mutable -> kj::Promise<void> {
-      // Try to get the callback from self
-      KJ_IF_SOME(callback, self->updateHookCallback) {
-        // Make a copy of the callback for use in this function scope
-        auto callbackCopy = callback.addRef(js);
+    // Get current IoContext to access the JS isolate
+    auto& context = IoContext::current();
+    jsg::Lock& lock = context.getCurrentLock();
 
-        // Build the arguments for the JavaScript callback
-        v8::Local<v8::Value> args[4] = {
-          js.num(op),                         // operation type
-          js.str(database),                   // database name
-          js.str(table),                      // table name
-          js.num(static_cast<double>(rowid))  // rowid as double
-        };
+    // Set flag to prevent re-entrancy
+    processingUpdateHooks = true;
 
-        // Call the JavaScript callback with the arguments
-        auto handle = callbackCopy.getHandle(js);
-        auto undefined = v8::Undefined(js.v8Isolate);
-        handle->Call(js.v8Context(), undefined, 4, args).ToLocalChecked();
+    // Try to get the callback from this object
+    KJ_IF_SOME(callback, updateHookCallback) {
+      // Make a copy of the callback for use in this function scope
+      auto callbackCopy = callback.addRef(lock);
+
+      // Build the arguments for the JavaScript callback
+      v8::Local<v8::Value> args[3];
+
+      // Convert enum to string for JS friendly API
+      if (op == SqliteDatabase::UpdateOperation::INSERT) {
+        args[0] = lock.str(kj::StringPtr("insert"));
+      } else if (op == SqliteDatabase::UpdateOperation::UPDATE) {
+        args[0] = lock.str(kj::StringPtr("update"));
+      } else {
+        args[0] = lock.str(kj::StringPtr("delete"));
       }
 
-      return kj::READY_NOW;
-    }).detach([](kj::Exception&& e) {
-      // Just log any errors that occur in the hook callback
-      IoContext::current().logUncaughtExceptionAsync(
-          UncaughtExceptionSource::ASYNC_TASK, kj::mv(e));
-    });
+      args[1] = lock.str(tableCopy);                   // table name
+      args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+
+      // Call the JavaScript callback with the arguments
+      auto handle = callbackCopy.getHandle(lock);
+      auto undefined = v8::Undefined(lock.v8Isolate);
+
+      // Call the callback and catch any exceptions
+      try {
+        handle->Call(lock.v8Context(), undefined, 3, args).ToLocalChecked();
+      } catch (kj::Exception& e) {
+        // Log any errors but don't let them propagate
+        context.logUncaughtExceptionAsync(UncaughtExceptionSource::ASYNC_TASK, kj::cp(e));
+      }
+    }
+
+    // Reset the flag
+    processingUpdateHooks = false;
   }));
+}
+
+void SqlStorage::executePendingUpdateHooks() {
+  // This is now a stub function as we're executing hooks directly
+  // Kept for API compatibility
 }
 
 void SqlStorage::clearUpdateHook(jsg::Lock& js) {
@@ -149,6 +168,84 @@ void SqlStorage::clearUpdateHook(jsg::Lock& js) {
   // Clear the SQLite update hook
   auto& db = getDb(js);
   db.setUpdateHook(kj::none);
+
+  // Reset state
+  processingUpdateHooks = false;
+}
+
+void SqlStorage::setRowChangeHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback) {
+  // Store the JavaScript callback function
+  rowChangeHookCallback = kj::mv(callback);
+
+  // Get the SQLite database
+  auto& db = getDb(js);
+
+  // Set the row change hook using regular update hook
+  db.setRowChangeHook(SqliteDatabase::RowChangeHookCallback(
+      [this](SqliteDatabase::UpdateOperation op, kj::StringPtr table, int64_t rowid) {
+    // Skip if we're already processing hooks (prevent re-entrancy)
+    if (processingRowChangeHooks) {
+      return;
+    }
+
+    // Create a copy of the table name string
+    auto tableCopy = kj::str(table);
+
+    // Get current IoContext to access the JS isolate
+    auto& context = IoContext::current();
+    jsg::Lock& lock = context.getCurrentLock();
+
+    // Set flag to prevent re-entrancy
+    processingRowChangeHooks = true;
+
+    // Try to get the callback from this object
+    KJ_IF_SOME(callback, rowChangeHookCallback) {
+      // Make a copy of the callback for use in this function scope
+      auto callbackCopy = callback.addRef(lock);
+
+      // Build the arguments for the JavaScript callback
+      v8::Local<v8::Value> args[3];
+
+      // Convert enum to string for JS friendly API
+      if (op == SqliteDatabase::UpdateOperation::INSERT) {
+        args[0] = lock.str(kj::StringPtr("insert"));
+      } else if (op == SqliteDatabase::UpdateOperation::UPDATE) {
+        args[0] = lock.str(kj::StringPtr("update"));
+      } else {
+        args[0] = lock.str(kj::StringPtr("delete"));
+      }
+
+      args[1] = lock.str(tableCopy);                   // table name
+      args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+
+      // Call the JavaScript callback with the arguments
+      auto handle = callbackCopy.getHandle(lock);
+      auto undefined = v8::Undefined(lock.v8Isolate);
+
+      // Call the callback and catch any exceptions
+      try {
+        handle->Call(lock.v8Context(), undefined, 3, args).ToLocalChecked();
+      } catch (kj::Exception& e) {
+        // Log any errors but don't let them propagate
+        context.logUncaughtExceptionAsync(UncaughtExceptionSource::ASYNC_TASK, kj::cp(e));
+      }
+    }
+
+    // Reset the flag
+    processingRowChangeHooks = false;
+  }));
+}
+
+void SqlStorage::clearRowChangeHook(jsg::Lock& js) {
+  // Clear the JavaScript callback
+  rowChangeHookCallback = kj::none;
+
+  // Clear the SQLite row change hook
+  auto& db = getDb(js);
+  db.setRowChangeHook(kj::none);
+
+  // Reset state
+  processingRowChangeHooks = false;
 }
 
 bool SqlStorage::isAllowedName(kj::StringPtr name) const {

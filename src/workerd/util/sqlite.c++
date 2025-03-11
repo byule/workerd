@@ -1246,8 +1246,25 @@ void SqliteDatabase::setUpdateHook(kj::Maybe<UpdateHookCallback> callback) {
             sqlite3_int64 rowid) {
       auto& db = *static_cast<SqliteDatabase*>(userData);
       KJ_IF_SOME(callback, db.updateHookCallback) {
-        // Call the user's callback with the operation details
-        callback(operation, dbName, tableName, rowid);
+        // Convert SQLite's operation code to our enum
+        // SQLite operation constants: SQLITE_INSERT = 18, SQLITE_UPDATE = 23, SQLITE_DELETE = 9
+        UpdateOperation op;
+        switch (operation) {
+          case 18:
+            op = UpdateOperation::INSERT;
+            break;
+          case 23:
+            op = UpdateOperation::UPDATE;
+            break;
+          case 9:
+            op = UpdateOperation::DELETE;
+            break;
+          default:
+            return;  // Unknown operation, don't call the callback
+        }
+
+        // Call the user's callback with the mapped operation (skipping database name)
+        callback(op, tableName, rowid);
       }
     },
         this);
@@ -1257,6 +1274,51 @@ void SqliteDatabase::setUpdateHook(kj::Maybe<UpdateHookCallback> callback) {
 
     // Unregister the SQLite update hook
     sqlite3_update_hook(db, nullptr, nullptr);
+  }
+}
+
+void SqliteDatabase::setRowChangeHook(kj::Maybe<RowChangeHookCallback> callback) {
+  // Get the sqlite3 database handle, checking if it's valid
+  sqlite3& dbRef = KJ_ASSERT_NONNULL(maybeDb, "database not opened or previous reset() failed");
+  sqlite3* db = &dbRef;
+
+  // Store the callback
+  rowChangeHookCallback = kj::mv(callback);
+
+  if (rowChangeHookCallback != kj::none) {
+    // Register the regular SQLite update hook (this is simpler than pre-update hook)
+    sqlite3_update_hook(db,
+        [](void* userData, int operation, const char* dbName, const char* tableName,
+            sqlite3_int64 rowid) {
+      auto& dbObj = *static_cast<SqliteDatabase*>(userData);
+      KJ_IF_SOME(callback, dbObj.rowChangeHookCallback) {
+        // Convert SQLite's operation code to our enum
+        // SQLite operation constants: SQLITE_INSERT = 18, SQLITE_UPDATE = 23, SQLITE_DELETE = 9
+        UpdateOperation op;
+        switch (operation) {
+          case 18:
+            op = UpdateOperation::INSERT;
+            break;
+          case 23:
+            op = UpdateOperation::UPDATE;
+            break;
+          case 9:
+            op = UpdateOperation::DELETE;
+            break;
+          default:
+            return;  // Unknown operation, don't call the callback
+        }
+
+        // Call the row change hook callback
+        callback(op, tableName, rowid);
+      }
+    },
+        this);
+  } else {
+    // Clear the hook if no callback is registered and if the update hook is not in use
+    if (updateHookCallback == kj::none) {
+      sqlite3_update_hook(db, nullptr, nullptr);
+    }
   }
 }
 

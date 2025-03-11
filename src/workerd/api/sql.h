@@ -42,6 +42,12 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   // Unregister any previously registered update hook
   void clearUpdateHook(jsg::Lock& js);
 
+  // Register a callback function that will be invoked when a row changes
+  void setRowChangeHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback);
+
+  // Unregister any previously registered row change hook
+  void clearRowChangeHook(jsg::Lock& js);
+
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
 
@@ -56,6 +62,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       // Update hook API is experimental-only
       JSG_METHOD(setUpdateHook);
       JSG_METHOD(clearUpdateHook);
+
+      // Row change hook API is experimental-only
+      JSG_METHOD(setRowChangeHook);
+      JSG_METHOD(clearRowChangeHook);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -74,6 +84,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(storage);
     visitor.visit(updateHookCallback);
+    visitor.visit(rowChangeHookCallback);
   }
 
   bool isAllowedName(kj::StringPtr name) const override;
@@ -93,6 +104,20 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   // The JavaScript update hook callback function
   kj::Maybe<jsg::V8Ref<v8::Function>> updateHookCallback;
+
+  // The JavaScript row change hook callback function
+  kj::Maybe<jsg::V8Ref<v8::Function>> rowChangeHookCallback;
+
+  // Flag to track whether we're currently processing update hooks
+  // to avoid re-entrancy issues when executing SQL from within hooks
+  bool processingUpdateHooks = false;
+
+  // Flag to track whether we're currently processing row change hooks
+  // to avoid re-entrancy issues when executing SQL from within hooks
+  bool processingRowChangeHooks = false;
+
+  // This method is kept for API compatibility but is now a stub
+  void executePendingUpdateHooks();
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {
