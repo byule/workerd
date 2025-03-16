@@ -98,6 +98,12 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   // This method is kept for API compatibility but is now a stub
   void executePendingUpdateHooks();
+  
+  // Helper function to convert lazy row values to JavaScript objects
+  static jsg::JsObject convertLazyRowToJsObject(jsg::Lock& js, SqliteDatabase::LazyRowValues& values);
+  
+  // For testing lazy loading - expose extraction counts 
+  static int getRowExtractionCount(SqliteDatabase::LazyRowValues& values);
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {

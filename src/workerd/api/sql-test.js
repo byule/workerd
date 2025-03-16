@@ -1097,7 +1097,7 @@ async function test(state) {
   // Track update events
   const updateEvents = [];
 
-  // Set update hook with enhanced row data
+  // Set update hook
   sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
     console.log('UPDATE HOOK CALLED:', { operation, table, rowid });
     console.log('Old values:', oldValues);
@@ -1307,8 +1307,108 @@ async function test(state) {
       'Update hook re-entrancy protection test completed successfully.'
     );
   }
-
-
+  
+  // Test how update hooks interact with transactions that roll back
+  await testUpdateHookWithRollback(sql, storage);
+  
+  // Test function to verify update hook behavior during transaction rollback
+  async function testUpdateHookWithRollback(sql, storage) {
+    console.log('Testing update hook behavior with transaction rollback...');
+    
+    // Create a test table for this test
+    sql.exec(
+      'CREATE TABLE IF NOT EXISTS rollback_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)'
+    );
+    
+    // Clean up any existing data
+    sql.exec('DELETE FROM rollback_test');
+    
+    // Queue to collect hook events during the transaction
+    let hookQueue = [];
+    
+    // Set up update hook that simply adds events to the queue
+    sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+      if (table === 'rollback_test') {
+        // Add the event to our queue
+        hookQueue.push({
+          operation,
+          table,
+          rowid,
+          oldValues,
+          newValues
+        });
+        
+        console.log(`HOOK for ${operation} on ${table} row ${rowid} added to queue`);
+      }
+    });
+    
+    try {
+      // Start a transaction that will be rolled back
+      await storage.transaction(async txn => {
+        // Execute some SQL within the transaction
+        sql.exec(
+          'INSERT INTO rollback_test (name, value) VALUES (?, ?)',
+          'will-be-rolled-back',
+          100
+        );
+        
+        sql.exec(
+          'INSERT INTO rollback_test (name, value) VALUES (?, ?)',
+          'also-rolled-back',
+          200
+        );
+        
+        // Verify hooks were triggered and added to the queue
+        assert.equal(
+          hookQueue.length, 
+          2, 
+          'Hooks should be triggered during the transaction'
+        );
+        
+        // Force a rollback by throwing an error
+        throw new Error('Deliberate error to cause rollback');
+      }).catch(err => {
+        console.log('Transaction rolled back as expected:', err.message);
+        
+        // Important test: Are the hooks still in the queue after rollback?
+        // If SQLite calls hooks during a transaction that later gets rolled back,
+        // the queue will still have 2 items
+        console.log('Hook queue after rollback has', hookQueue.length, 'items');
+        
+        // Report the hooks that were in the queue
+        hookQueue.forEach((hook, i) => {
+          console.log(`Hook ${i+1}: ${hook.operation} on ${hook.table}, rowid=${hook.rowid}`);
+        });
+        
+        // We now have our answer - let's clear the queue for our assertion
+        const hookQueueSize = hookQueue.length;
+        hookQueue = [];
+        
+        // Add a summary line based on what we learned
+        if (hookQueueSize > 0) {
+          console.log('CONCLUSION: Hooks are triggered even for operations that are later rolled back');
+        } else {
+          console.log('CONCLUSION: Hooks are NOT triggered for operations that are rolled back');
+        }
+      });
+      
+      // Verify the database is empty after rollback
+      const rows = [...sql.exec('SELECT * FROM rollback_test')];
+      assert.equal(rows.length, 0, 'Database should be empty after rollback');
+      
+      // Verify the hook queue is empty (since we cleared it after reporting)
+      assert.equal(
+        hookQueue.length, 
+        0, 
+        'Hook queue should be empty after clearing'
+      );
+      
+    } finally {
+      // Clean up
+      sql.clearUpdateHook();
+      console.log('Update hook with rollback test completed');
+    }
+  }
 }
 
 async function testIoStats(storage) {

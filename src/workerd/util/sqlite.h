@@ -16,6 +16,7 @@
 struct sqlite3;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
+struct sqlite3_value;
 
 KJ_DECLARE_NON_POLYMORPHIC(sqlite3_stmt);
 
@@ -273,20 +274,67 @@ class SqliteDatabase {
   
   // Row data (array of columns)
   using RowData = kj::Array<Column>;
-
+  
+  // Forward declaration of lazy row access class
+  class LazyRowValues;
+  
   // Function type for update hook callbacks
   // - operation: The operation type (INSERT, UPDATE, DELETE)
   // - table: The table name
   // - rowid: The rowid of the affected row
-  // - oldValues: For UPDATE/DELETE operations, columns with their original values before the change
-  // - newValues: For INSERT/UPDATE operations, columns with their new values after the change
+  // - oldValues: For UPDATE/DELETE operations, a lazy accessor for the original values
+  // - newValues: For INSERT/UPDATE operations, a lazy accessor for the new values
   //   NOTE: For INSERT, oldValues will be empty. For DELETE, newValues will be empty.
   using UpdateHookCallback = kj::Function<void(
       UpdateOperation operation,
       kj::StringPtr table,
       int64_t rowid,
-      RowData oldValues,
-      RowData newValues)>;
+      LazyRowValues& oldValues,
+      LazyRowValues& newValues)>;
+      
+  // Class that provides lazy access to row values
+  // Values are only extracted when explicitly accessed
+  class LazyRowValues {
+  public:
+    // SQLite operation constants (from sqlite3.h)
+    static constexpr int SQLITE_INSERT = 18;
+    static constexpr int SQLITE_DELETE = 9;
+    static constexpr int SQLITE_UPDATE = 23;
+    
+    LazyRowValues() : db(nullptr), operation(SQLITE_INSERT), isOldValues(false), columnCount(0),
+                     extractionCount(0) {}
+    
+    LazyRowValues(sqlite3* db, int operation, bool isOldValues, int columnCount)
+        : db(db), operation(operation), isOldValues(isOldValues), columnCount(columnCount),
+          extractionCount(0) {}
+    
+    // Get a column by index
+    Column getColumn(int columnIndex);
+    
+    // Get all columns
+    RowData getAllColumns();
+    
+    // Get the number of columns
+    int getColumnCount() const { return columnCount; }
+    
+    // Check if this object contains any data
+    bool isEmpty() const { return db == nullptr || columnCount == 0; }
+    
+    // For testing: Get number of times columns were extracted
+    int getExtractionCount() const { return extractionCount; }
+    
+  private:
+    sqlite3* db;                   // Database handle
+    int operation KJ_UNUSED;       // SQLite operation type (SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE)
+    bool isOldValues;              // Whether this represents old values (true) or new values (false)
+    int columnCount;               // Number of columns
+    
+    // For testing: track how many columns were extracted
+    mutable int extractionCount;
+    
+    // Extracts a value from a SQLite value
+    static ColumnValue extractValue(sqlite3_value* value);
+  };
 
   // Set a callback that will be invoked whenever a row is inserted, updated, or deleted.
   // The callback receives information about what operation occurred (INSERT, UPDATE, DELETE),
