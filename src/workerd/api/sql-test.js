@@ -1087,6 +1087,228 @@ async function test(state) {
       { a: 3, b: 3 },
     ]);
   }
+
+  // Test update hook
+  // Create test table
+  sql.exec(
+    'CREATE TABLE IF NOT EXISTS update_hook_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)'
+  );
+
+  // Track update events
+  const updateEvents = [];
+
+  // Set update hook with enhanced row data
+  sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+    console.log('UPDATE HOOK CALLED:', { operation, table, rowid });
+    console.log('Old values:', oldValues);
+    console.log('New values:', newValues);
+
+    updateEvents.push({
+      operation,
+      table,
+      rowid,
+      oldValues,
+      newValues
+    });
+
+    // While it's technically possible to call SQLite from within the hook,
+    // it's not recommended as it can lead to complex re-entrancy issues.
+    // The implementation defends against this by using a flag to prevent nested calls.
+  });
+
+  // INSERT operation (should trigger hook)
+  sql.exec(
+    'INSERT INTO update_hook_test (name, value) VALUES (?, ?)',
+    'test1',
+    100
+  );
+
+  // UPDATE operation (should trigger hook)
+  sql.exec(
+    'UPDATE update_hook_test SET value = ? WHERE name = ?',
+    200,
+    'test1'
+  );
+
+  // DELETE operation (should trigger hook)
+  sql.exec('DELETE FROM update_hook_test WHERE name = ?', 'test1');
+
+  // Verify we got 3 events (INSERT, UPDATE, DELETE)
+  console.log('Event count:', updateEvents.length);
+  for (const event of updateEvents) {
+    console.log(event);
+  }
+  assert.equal(
+    updateEvents.length,
+    3,
+    'Update hook should have been called 3 times'
+  );
+
+  // Verify the INSERT event
+  assert.equal(
+    updateEvents[0].operation,
+    'insert',
+    'First operation should be "insert"'
+  );
+  assert.equal(
+    updateEvents[0].table,
+    'update_hook_test',
+    'Table name should be update_hook_test'
+  );
+  // Verify old values are empty for INSERT
+  assert.deepEqual(
+    Object.keys(updateEvents[0].oldValues).length,
+    0,
+    'Old values should be empty for INSERT'
+  );
+  // Verify new values for INSERT
+  // We're using the column indexes rather than names since they might be reported as column0, column1, etc.
+  assert.equal(
+    updateEvents[0].newValues.column1,
+    'test1',
+    'New values should contain the inserted name'
+  );
+  assert.equal(
+    updateEvents[0].newValues.column2,
+    100,
+    'New values should contain the inserted value'
+  );
+
+  // Verify the UPDATE event
+  assert.equal(
+    updateEvents[1].operation,
+    'update',
+    'Second operation should be "update"'
+  );
+  assert.equal(
+    updateEvents[1].table,
+    'update_hook_test',
+    'Table name should be update_hook_test'
+  );
+  // Verify old values for UPDATE
+  assert.equal(
+    updateEvents[1].oldValues.column1,
+    'test1',
+    'Old values should contain the original name'
+  );
+  assert.equal(
+    updateEvents[1].oldValues.column2,
+    100,
+    'Old values should contain the original value'
+  );
+  // Verify new values for UPDATE
+  assert.equal(
+    updateEvents[1].newValues.column1,
+    'test1',
+    'New values should contain the unchanged name'
+  );
+  assert.equal(
+    updateEvents[1].newValues.column2,
+    200,
+    'New values should contain the updated value'
+  );
+
+  // Verify the DELETE event
+  assert.equal(
+    updateEvents[2].operation,
+    'delete',
+    'Third operation should be "delete"'
+  );
+  assert.equal(
+    updateEvents[2].table,
+    'update_hook_test',
+    'Table name should be update_hook_test'
+  );
+  // Verify old values for DELETE
+  assert.equal(
+    updateEvents[2].oldValues.column1,
+    'test1',
+    'Old values should contain the deleted name'
+  );
+  assert.equal(
+    updateEvents[2].oldValues.column2,
+    200,
+    'Old values should contain the deleted value'
+  );
+  // Verify new values are empty for DELETE
+  assert.deepEqual(
+    Object.keys(updateEvents[2].newValues).length,
+    0,
+    'New values should be empty for DELETE'
+  );
+
+  // Clear the update hook
+  sql.clearUpdateHook();
+
+  // This shouldn't trigger any events since we cleared the hook
+  sql.exec(
+    'INSERT INTO update_hook_test (name, value) VALUES (?, ?)',
+    'test2',
+    300
+  );
+
+  // Verify no additional events were captured
+  assert.equal(
+    updateEvents.length,
+    3,
+    'No new events should be captured after clearing the hook'
+  );
+
+  // Test that our re-entrancy protection works
+  await testUpdateHookReentrancy(sql);
+
+  // Test function to verify update hook re-entrancy protection
+  async function testUpdateHookReentrancy(sql) {
+    // Create a test table
+    sql.exec(
+      'CREATE TABLE IF NOT EXISTS reentrancy_test (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER)'
+    );
+
+    // Track whether we have a protection against SQL re-entrance
+    let hasReentrancyProtection = false;
+
+    // Set up a hook that attempts a single SQL operation to test re-entrancy protection
+    sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+      // Attempt to execute a SQL operation from within the hook
+      try {
+        // Try to execute a simple SQL statement
+        sql.exec('SELECT 1');
+
+        // If we get here, there's no re-entrancy protection
+        console.log("Re-entrancy protection test: SQL execution succeeded (no protection)");
+      } catch (error) {
+        // If we get an error, then we have re-entrancy protection
+        hasReentrancyProtection = true;
+
+        // Log the error message - we now expect a standard SQLite authorization error
+        console.log("Re-entrancy protection test: SQL execution failed with:", error.message);
+      }
+    });
+
+    console.log('Testing update hook re-entrancy protection...');
+
+    // Trigger the update hook with an INSERT operation
+    sql.exec(
+      'INSERT INTO reentrancy_test (name, counter) VALUES (?, ?)',
+      'test1',
+      1
+    );
+
+    // Verify that re-entrancy protection worked
+    assert.equal(
+      hasReentrancyProtection,
+      true,
+      'SQL re-entrancy should be prevented when called from within an update hook'
+    );
+
+    // Clean up
+    sql.clearUpdateHook();
+    console.log(
+      'Update hook re-entrancy protection test completed successfully.'
+    );
+  }
+
+
 }
 
 async function testIoStats(storage) {

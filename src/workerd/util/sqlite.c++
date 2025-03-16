@@ -633,6 +633,11 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(const Regulator& r
     uint prepFlags,
     Multi multi,
     kj::Maybe<kj::Vector<Statement>&> prelude) {
+  // Block SQL operations if we're executing within an update hook
+  if (executingUpdateHook) {
+    KJ_FAIL_REQUIRE("SQL operations are not allowed within update hooks");
+  }
+  
   sqlite3* db = &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
 
   ParseContext parseContext;
@@ -833,6 +838,10 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     kj::Maybe<kj::StringPtr> param2,
     kj::Maybe<kj::StringPtr> dbName,
     kj::Maybe<kj::StringPtr> triggerName) {
+  // The re-entrancy protection is now in prepareSql, which is called before authorizer checks
+  // We should never reach here during an update hook, but we'll keep a fallback check just in case
+  KJ_ASSERT(!executingUpdateHook, "Authorizer called during update hook, which should have been blocked in prepareSql");
+      
   const Regulator& regulator = KJ_UNWRAP_OR(currentRegulator, {
     // We're not currently preparing a statement, so we didn't expect the authorizer callback to
     // run. We blanket-deny in this case as a precaution.
@@ -1230,6 +1239,156 @@ void SqliteDatabase::setupSecurity(sqlite3* db) {
   // 8. Set the SQLITE_PRINTF_PRECISION_LIMIT compile flag.
   // (handled in BUILD.sqlite3)
 }
+
+// Implementation of LazyRowValues methods
+
+SqliteDatabase::ColumnValue SqliteDatabase::LazyRowValues::extractValue(sqlite3_value* value) {
+  if (value == nullptr) return nullptr;
+  
+  int type = ::sqlite3_value_type(value);
+  switch (type) {
+    case SQLITE_INTEGER:
+      return static_cast<double>(::sqlite3_value_int64(value));
+    case SQLITE_FLOAT:
+      return ::sqlite3_value_double(value);
+    case SQLITE_TEXT: {
+      const char* text = reinterpret_cast<const char*>(::sqlite3_value_text(value));
+      return text ? kj::str(text) : kj::String();
+    }
+    case SQLITE_BLOB: {
+      int bytes = ::sqlite3_value_bytes(value);
+      const void* blob = ::sqlite3_value_blob(value);
+      if (blob && bytes > 0) {
+        return kj::heapArray<const byte>(static_cast<const byte*>(blob), bytes);
+      }
+      return nullptr;
+    }
+    case SQLITE_NULL:
+    default:
+      return nullptr;
+  }
+}
+
+SqliteDatabase::Column SqliteDatabase::LazyRowValues::getColumn(int columnIndex) {
+  if (isEmpty() || columnIndex < 0 || columnIndex >= columnCount) {
+    return { kj::str("invalid"), nullptr };
+  }
+  
+  KJ_DBG("LazyRowValues: Extracting single column", columnIndex, 
+         isOldValues ? "old values" : "new values");
+  
+  // Increment extraction counter for testing
+  extractionCount++;
+  
+  SqliteDatabase::Column col;
+  // Generate column name (columnN)
+  col.name = kj::str("column", columnIndex);
+  
+  // Extract the value based on whether this is for old or new values
+  sqlite3_value* sqliteValue = nullptr;
+  if (isOldValues) {
+    ::sqlite3_preupdate_old(db, columnIndex, &sqliteValue);
+  } else {
+    ::sqlite3_preupdate_new(db, columnIndex, &sqliteValue);
+  }
+  
+  col.value = extractValue(sqliteValue);
+  return col;
+}
+
+SqliteDatabase::RowData SqliteDatabase::LazyRowValues::getAllColumns() {
+  if (isEmpty()) {
+    return kj::Array<SqliteDatabase::Column>(0);
+  }
+  
+  KJ_DBG("LazyRowValues: Extracting ALL columns", columnCount, 
+         isOldValues ? "old values" : "new values");
+  
+  kj::Vector<SqliteDatabase::Column> columns(columnCount);
+  
+  // Extract all columns
+  for (int i = 0; i < columnCount; i++) {
+    columns.add(getColumn(i));
+  }
+  
+  return columns.releaseAsArray();
+}
+
+// The update hook implementation is inside the setUpdateHook method
+
+// The actual update hook implementation is now a method inside the class
+void SqliteDatabase::setUpdateHook(kj::Maybe<UpdateHookCallback> callback) {
+  // Get the sqlite3 database handle, checking if it's valid
+  sqlite3& dbRef = KJ_ASSERT_NONNULL(maybeDb, "database not opened or previous reset() failed");
+  sqlite3* db = &dbRef;
+
+  if (callback != kj::none) {
+    // Store the callback
+    updateHookCallback = kj::mv(callback);
+
+    // Setup the update hook with a simpler version
+    sqlite3_preupdate_hook(db, 
+        // C-style callback implemented as a lambda
+        [](void* userData, sqlite3* db, int operation, const char* dbName, const char* tableName,
+           sqlite3_int64 oldRowid, sqlite3_int64 newRowid) {
+          auto& self = *static_cast<SqliteDatabase*>(userData);
+          
+          // Set the flag indicating we're in an update hook
+          self.executingUpdateHook = true;
+          KJ_DEFER(self.executingUpdateHook = false);
+                
+          KJ_IF_SOME(callback, self.updateHookCallback) {
+            // Get the number of columns affected by this change
+            int columnCount = sqlite3_preupdate_count(db);
+            
+            // Our enum for the operation type
+            UpdateOperation op;
+            
+            // Create lazy value accessors for old and new values
+            // For INSERT: oldValues is empty, newValues has data
+            // For UPDATE: both oldValues and newValues have data
+            // For DELETE: oldValues has data, newValues is empty
+            LazyRowValues oldValues, newValues;
+            
+            switch (operation) {
+              case SQLITE_INSERT:
+                op = UpdateOperation::INSERT;
+                // For INSERT, only new values exist
+                newValues = LazyRowValues(db, operation, false, columnCount);
+                break;
+              
+              case SQLITE_UPDATE:
+                op = UpdateOperation::UPDATE;
+                // For UPDATE, both old and new values exist
+                oldValues = LazyRowValues(db, operation, true, columnCount);
+                newValues = LazyRowValues(db, operation, false, columnCount);
+                break;
+              
+              case SQLITE_DELETE:
+                op = UpdateOperation::DELETE;
+                // For DELETE, only old values exist
+                oldValues = LazyRowValues(db, operation, true, columnCount);
+                break;
+                
+              default:
+                // Unknown operation - should never happen
+                return;
+            }
+            
+            // Call the user's callback with the lazy value accessors
+            callback(op, tableName, (operation == SQLITE_INSERT) ? newRowid : oldRowid, oldValues, newValues);
+          }
+        },
+        this);
+  } else {
+    // Clear our stored callback
+    updateHookCallback = kj::none;
+
+    // Unregister the SQLite pre-update hook
+    sqlite3_preupdate_hook(db, nullptr, nullptr);
+  }
+}
+
 
 SqliteDatabase::Statement SqliteDatabase::prepare(
     const Regulator& regulator, kj::StringPtr sqlCode) {

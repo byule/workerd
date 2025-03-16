@@ -6,6 +6,7 @@
 
 #include <kj/filesystem.h>
 #include <kj/function.h>
+#include <kj/hash.h>
 #include <kj/list.h>
 #include <kj/one-of.h>
 #include <kj/string.h>
@@ -258,6 +259,42 @@ class SqliteDatabase {
     }
   }
 
+  // Operation type for update hook callbacks (more readable than SQLite's numeric constants)
+  enum class UpdateOperation { INSERT, UPDATE, DELETE };
+
+  // Column value for a row
+  using ColumnValue = kj::OneOf<kj::String, double, kj::Array<const byte>, decltype(nullptr)>;
+  
+  // Column data structure for a row
+  struct Column {
+    kj::String name;
+    ColumnValue value;
+  };
+  
+  // Row data (array of columns)
+  using RowData = kj::Array<Column>;
+
+  // Function type for update hook callbacks
+  // - operation: The operation type (INSERT, UPDATE, DELETE)
+  // - table: The table name
+  // - rowid: The rowid of the affected row
+  // - oldValues: For UPDATE/DELETE operations, columns with their original values before the change
+  // - newValues: For INSERT/UPDATE operations, columns with their new values after the change
+  //   NOTE: For INSERT, oldValues will be empty. For DELETE, newValues will be empty.
+  using UpdateHookCallback = kj::Function<void(
+      UpdateOperation operation,
+      kj::StringPtr table,
+      int64_t rowid,
+      RowData oldValues,
+      RowData newValues)>;
+
+  // Set a callback that will be invoked whenever a row is inserted, updated, or deleted.
+  // The callback receives information about what operation occurred (INSERT, UPDATE, DELETE),
+  // the table name, the rowid of the affected row, and maps of the old and new column values.
+  // Pass kj::none to unregister any previously registered callback.
+  void setUpdateHook(kj::Maybe<UpdateHookCallback> callback);
+
+
  private:
   const Vfs& vfs;
   kj::Path path;
@@ -299,6 +336,14 @@ class SqliteDatabase {
 
   // True if in a BEGIN TRANSACTION transaction.
   bool inTransaction = false;
+
+  // The update hook callback, if registered
+  kj::Maybe<UpdateHookCallback> updateHookCallback;
+  
+  // Flag to track when we're executing inside an update hook callback
+  // Used to prevent re-entrancy into database operations
+  bool executingUpdateHook = false;
+
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
 

@@ -90,6 +90,126 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   return pages * getPageSize(db);
 }
 
+// The SqlStorage class implementation
+
+void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback) {
+  // Store the JavaScript callback function
+  updateHookCallback = kj::mv(callback);
+
+  // Get the SQLite database
+  auto& db = getDb(js);
+
+  // Set the update hook with a direct callback that executes immediately
+  // Re-entrancy protection is now handled at the SQLite level with the executingUpdateHook flag
+  db.setUpdateHook(SqliteDatabase::UpdateHookCallback(
+      [this](SqliteDatabase::UpdateOperation op, kj::StringPtr table, int64_t rowid,
+             SqliteDatabase::RowData oldValues, SqliteDatabase::RowData newValues) {
+    // Create a copy of the table name string
+    auto tableCopy = kj::str(table);
+
+    // Get current IoContext to access the JS isolate
+    auto& context = IoContext::current();
+    jsg::Lock& lock = context.getCurrentLock();
+
+    // Try to get the callback from this object
+    KJ_IF_SOME(callback, updateHookCallback) {
+      // Make a copy of the callback for use in this function scope
+      auto callbackCopy = callback.addRef(lock);
+
+      // Build the arguments for the JavaScript callback
+      v8::Local<v8::Value> args[5];
+
+      // Convert enum to string for JS friendly API
+      if (op == SqliteDatabase::UpdateOperation::INSERT) {
+        args[0] = lock.str(kj::StringPtr("insert"));
+      } else if (op == SqliteDatabase::UpdateOperation::UPDATE) {
+        args[0] = lock.str(kj::StringPtr("update"));
+      } else {
+        args[0] = lock.str(kj::StringPtr("delete"));
+      }
+
+      args[1] = lock.str(tableCopy);                   // table name
+      args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+      
+      // Convert old values to a JavaScript object
+      v8::Local<v8::Object> oldObj = v8::Object::New(lock.v8Isolate);
+      for (auto& column : oldValues) {
+        v8::Local<v8::Value> value;
+        
+        KJ_SWITCH_ONEOF(column.value) {
+          KJ_CASE_ONEOF(str, kj::String) {
+            value = lock.str(str);
+          }
+          KJ_CASE_ONEOF(num, double) {
+            value = lock.num(num);
+          }
+          KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
+            value = lock.wrapBytes(kj::heapArray(blob.asPtr()));
+          }
+          KJ_CASE_ONEOF(null, decltype(nullptr)) {
+            value = v8::Null(lock.v8Isolate);
+          }
+        }
+        
+        oldObj->Set(lock.v8Context(), lock.str(column.name), value).Check();
+      }
+      args[3] = oldObj;  // old values as JS object
+      
+      // Convert new values to a JavaScript object
+      v8::Local<v8::Object> newObj = v8::Object::New(lock.v8Isolate);
+      for (auto& column : newValues) {
+        v8::Local<v8::Value> value;
+        
+        KJ_SWITCH_ONEOF(column.value) {
+          KJ_CASE_ONEOF(str, kj::String) {
+            value = lock.str(str);
+          }
+          KJ_CASE_ONEOF(num, double) {
+            value = lock.num(num);
+          }
+          KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
+            value = lock.wrapBytes(kj::heapArray(blob.asPtr()));
+          }
+          KJ_CASE_ONEOF(null, decltype(nullptr)) {
+            value = v8::Null(lock.v8Isolate);
+          }
+        }
+        
+        newObj->Set(lock.v8Context(), lock.str(column.name), value).Check();
+      }
+      args[4] = newObj;  // new values as JS object
+
+      // Call the JavaScript callback with the arguments
+      auto handle = callbackCopy.getHandle(lock);
+      auto undefined = v8::Undefined(lock.v8Isolate);
+
+      // Call the callback and catch any exceptions
+      try {
+        handle->Call(lock.v8Context(), undefined, 5, args).ToLocalChecked();
+      } catch (kj::Exception& e) {
+        // Log any errors but don't let them propagate
+        context.logUncaughtExceptionAsync(UncaughtExceptionSource::ASYNC_TASK, kj::cp(e));
+      }
+    }
+
+  }));
+}
+
+void SqlStorage::executePendingUpdateHooks() {
+  // This is now a stub function as we're executing hooks directly
+  // Kept for API compatibility
+}
+
+void SqlStorage::clearUpdateHook(jsg::Lock& js) {
+  // Clear the JavaScript callback
+  updateHookCallback = kj::none;
+
+  // Clear the SQLite update hook
+  auto& db = getDb(js);
+  db.setUpdateHook(kj::none);
+}
+
+
 bool SqlStorage::isAllowedName(kj::StringPtr name) const {
   return !name.startsWith("_cf_");
 }
@@ -387,6 +507,7 @@ void SqlStorage::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
     tracker.trackFieldWithSize(
         "IoPtr<SqllitDatabase::Statement>", sizeof(IoPtr<SqliteDatabase::Statement>));
   }
+  tracker.trackField("updateHookCallback", updateHookCallback);
 }
 
 }  // namespace workerd::api
