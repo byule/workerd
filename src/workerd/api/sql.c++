@@ -162,17 +162,25 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
       // Build the arguments for the JavaScript callback
       v8::Local<v8::Value> args[5];
 
-      // Convert enum to string for JS friendly API
-      if (op == SqliteDatabase::UpdateOperation::INSERT) {
-        args[0] = lock.str(kj::StringPtr("insert"));
-      } else if (op == SqliteDatabase::UpdateOperation::UPDATE) {
-        args[0] = lock.str(kj::StringPtr("update"));
-      } else {
-        args[0] = lock.str(kj::StringPtr("delete"));
-      }
+      // Wrap everything in a try-catch to handle JavaScript exceptions
+      try {
+        // Convert enum to string for JS friendly API
+        if (op == SqliteDatabase::UpdateOperation::INSERT) {
+          args[0] = lock.str(kj::StringPtr("insert"));
+        } else if (op == SqliteDatabase::UpdateOperation::UPDATE) {
+          args[0] = lock.str(kj::StringPtr("update"));
+        } else {
+          args[0] = lock.str(kj::StringPtr("delete"));
+        }
 
-      args[1] = lock.str(tableCopy);                   // table name
-      args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+        args[1] = lock.str(tableCopy);                   // table name
+        args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+      } catch (jsg::JsExceptionThrown& e) {
+        // Catch JavaScript exceptions but allow the transaction to continue
+        // This prevents the worker from crashing when JS exceptions occur in update hooks
+        KJ_LOG(WARNING, "JavaScript exception while preparing update hook callback arguments");
+        return;  // Exit the callback without calling the JavaScript function
+      }
 
       // Check if we're running the sql-lazy-test
       bool isLazyTest = tableCopy == "lazy_test";
@@ -332,12 +340,34 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
       auto handle = callbackCopy.getHandle(lock);
       auto undefined = v8::Undefined(lock.v8Isolate);
 
-      // Call the callback and catch any exceptions
-      try {
-        handle->Call(lock.v8Context(), undefined, 5, args).ToLocalChecked();
-      } catch (kj::Exception& e) {
-        // Log any errors but don't let them propagate
-        context.logUncaughtExceptionAsync(UncaughtExceptionSource::ASYNC_TASK, kj::cp(e));
+      // Use v8::TryCatch to catch JavaScript exceptions - this is the V8-recommended way to handle JS exceptions
+      v8::TryCatch tryCatch(lock.v8Isolate);
+      
+      // Call the callback and ignore the result
+      handle->Call(lock.v8Context(), undefined, 5, args);
+      
+      // Check if an exception occurred
+      if (tryCatch.HasCaught()) {
+        // An exception was thrown in JavaScript - log it but continue with the transaction
+        KJ_LOG(WARNING, "JavaScript exception in SQL update hook callback");
+        
+        // Get exception details for logging (if possible)
+        if (tryCatch.CanContinue()) {
+          auto exception = tryCatch.Exception();
+          if (!exception.IsEmpty()) {
+            // Try to get the exception message for logging
+            v8::Local<v8::Message> message = tryCatch.Message();
+            if (!message.IsEmpty()) {
+              v8::String::Utf8Value messageStr(lock.v8Isolate, message->Get());
+              if (*messageStr) {
+                KJ_LOG(INFO, "Exception message:", *messageStr);
+              }
+            }
+          }
+        }
+        
+        // Clear the exception so it doesn't propagate and crash the worker
+        tryCatch.Reset();
       }
     }
   }));
