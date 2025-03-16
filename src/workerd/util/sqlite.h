@@ -301,17 +301,12 @@ class SqliteDatabase {
     static constexpr int SQLITE_DELETE = 9;
     static constexpr int SQLITE_UPDATE = 23;
     
-    LazyRowValues() : db(nullptr), operation(SQLITE_INSERT), isOldValues(false), columnCount(0),
-                     extractionCount(0) {}
+    LazyRowValues() : db(nullptr), operation(SQLITE_INSERT), isOldValues(false), columnCount(0) {}
     
     LazyRowValues(sqlite3* db, int operation, bool isOldValues, int columnCount)
-        : db(db), operation(operation), isOldValues(isOldValues), columnCount(columnCount),
-          extractionCount(0) {}
+        : db(db), operation(operation), isOldValues(isOldValues), columnCount(columnCount) {}
     
-    // Get a column by index
-    Column getColumn(int columnIndex);
-    
-    // Get all columns
+    // Get all columns - extracts all data at once
     RowData getAllColumns();
     
     // Get the number of columns
@@ -320,17 +315,11 @@ class SqliteDatabase {
     // Check if this object contains any data
     bool isEmpty() const { return db == nullptr || columnCount == 0; }
     
-    // For testing: Get number of times columns were extracted
-    int getExtractionCount() const { return extractionCount; }
-    
   private:
     sqlite3* db;                   // Database handle
     int operation KJ_UNUSED;       // SQLite operation type (SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE)
     bool isOldValues;              // Whether this represents old values (true) or new values (false)
     int columnCount;               // Number of columns
-    
-    // For testing: track how many columns were extracted
-    mutable int extractionCount;
     
     // Extracts a value from a SQLite value
     static ColumnValue extractValue(sqlite3_value* value);

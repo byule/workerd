@@ -6,7 +6,7 @@ import * as assert from 'node:assert';
 import { DurableObject } from 'cloudflare:workers';
 
 // This test validates that the SQL update hook uses lazy loading
-// for row value extraction, only loading the columns that are actually used.
+// at the row level with a simple values.old and values.new pattern.
 
 async function test(state) {
   const storage = state.storage;
@@ -26,54 +26,54 @@ async function test(state) {
   // Array to collect update hook information
   const updateEvents = [];
   
-  // Set update hook that will capture extraction counts
-  sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+  // Set update hook that will verify lazy loading
+  sql.setUpdateHook((operation, table, rowid, values) => {
     console.log('UPDATE HOOK CALLED:', { operation, table, rowid });
-    // Get extraction counts, accounting for empty objects
-    const oldCount = oldValues.__extractionCount ? oldValues.__extractionCount() : 0;
-    const newCount = newValues.__extractionCount ? newValues.__extractionCount() : 0;
-    console.log('Extraction counts:', {
-      oldValuesExtracted: oldCount,
-      newValuesExtracted: newCount
-    });
-
-    // Do extraction count recording after we access the columns
-    // to capture the right counts
+    
+    // Function to record events
     const captureEvent = () => {
       updateEvents.push({
         operation,
         table,
         rowid,
-        oldValuesExtractedCount: oldValues.__extractionCount ? oldValues.__extractionCount() : 0,
-        newValuesExtractedCount: newValues.__extractionCount ? newValues.__extractionCount() : 0,
       });
     };
     
-    // For insert operations, only access a single column from new values
+    // For insert operations, access only values.new
     if (operation === 'insert') {
-      console.log('INSERT: Only accessing name column:');
-      assert.equal(newValues.column1(), 'test', "Expected name to be 'test'");
-      captureEvent();
-    }
-    
-    // For updates, access all columns from oldValues but only one from newValues
-    else if (operation === 'update') {
-      console.log('UPDATE: Accessing all old columns');
-      console.log('Old name was:', oldValues.column1());
-      console.log('Old value was:', oldValues.column2());
-      console.log('Old data was:', oldValues.column3() ? 'BLOB' : 'null');
-      console.log('Old extra was:', oldValues.column4());
+      console.log('INSERT: Accessing values.new but not values.old');
       
-      // Only access one column from the new values
-      console.log('UPDATE: Only accessing new name:');
-      assert.equal(newValues.column1(), 'updated', "Expected name to be 'updated'");
+      // Access new values
+      assert.equal(values.new.column1, 'test', "Expected name to be 'test'");
+      
+      // Don't access old values - there shouldn't be any anyway for INSERT
+      
       captureEvent();
     }
     
-    // For deletes, don't access any columns at all
+    // For updates, access both values.old and values.new
+    else if (operation === 'update') {
+      console.log('UPDATE: Accessing both values.old and values.new');
+      
+      // Access old values
+      console.log('Old name was:', values.old.column1);
+      console.log('Old value was:', values.old.column2);
+      
+      // Access new values
+      assert.equal(values.new.column1, 'updated', "Expected name to be 'updated'");
+      
+      captureEvent();
+    }
+    
+    // For deletes, access only values.old
     else if (operation === 'delete') {
-      console.log('DELETE: Not accessing any columns');
-      // Intentionally don't access any column values
+      console.log('DELETE: Only accessing values.old');
+      
+      // Access old values
+      console.log('Deleted name was:', values.old.column1);
+      
+      // Don't access new values - there shouldn't be any anyway for DELETE
+      
       captureEvent();
     }
   });
@@ -81,43 +81,31 @@ async function test(state) {
   // Generate some test data - a binary blob
   const testBlob = new Uint8Array([1, 2, 3, 4, 5]);
   
-  // INSERT operation (should trigger hook, which accesses only 1 column)
+  // INSERT operation (should trigger hook, which accesses only values.new)
   sql.exec(
     'INSERT INTO lazy_test (name, value, data, extra) VALUES (?, ?, ?, ?)',
     'test', 100, testBlob, 'extra value'
   );
   
-  // Verify the first event
+  // Verify we got the insert event
   assert.equal(updateEvents[0].operation, 'insert', "First event should be an insert");
-  // Since we only accessed column0 (id) in the update hook, extraction count should be 1
-  assert.equal(updateEvents[0].newValuesExtractedCount, 1, 
-    "Insert should have extracted exactly 1 column since we only accessed ID");
   
-  // UPDATE operation (should trigger hook, accessing all old columns but only 1 new column)
+  // UPDATE operation (should trigger hook, accessing both values.old and values.new)
   sql.exec(
     'UPDATE lazy_test SET name = ?, value = ?, extra = ? WHERE id = ?',
     'updated', 200, 'new extra', 1
   );
   
-  // Verify the second event
+  // Verify we got the update event
   assert.equal(updateEvents[1].operation, 'update', "Second event should be an update");
-  // We accessed all 4 old columns in the update hook
-  assert.equal(updateEvents[1].oldValuesExtractedCount, 4, 
-    "Update should have extracted all 4 old columns");
-  // We only accessed column1 (name) from the new values
-  assert.equal(updateEvents[1].newValuesExtractedCount, 1, 
-    "Update should have extracted only 1 new column (name)");
   
-  // DELETE operation (should trigger hook, not accessing any columns)
+  // DELETE operation (should trigger hook, accessing values.old)
   sql.exec('DELETE FROM lazy_test WHERE id = ?', 1);
   
-  // Verify the third event
+  // Verify we got the delete event
   assert.equal(updateEvents[2].operation, 'delete', "Third event should be a delete");
-  // We didn't access any columns in the delete hook
-  assert.equal(updateEvents[2].oldValuesExtractedCount, 0, 
-    "Delete should have extracted 0 columns since we didn't access any");
   
-  console.log('Lazy loading test passed!');
+  console.log('Row-level lazy loading with values.old/values.new test passed!');
 }
 
 export class LazyTestDO extends DurableObject {

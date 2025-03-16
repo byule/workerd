@@ -92,47 +92,162 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
 
 // The SqlStorage class implementation
 
-// Implementation of helper function to convert lazy rows to JS objects
-
-jsg::JsObject SqlStorage::convertLazyRowToJsObject(jsg::Lock& js, SqliteDatabase::LazyRowValues& values) {
-  // If empty, return an empty object
-  if (values.isEmpty()) {
-    return js.obj();
-  }
-
-  // Get all columns from the lazy values container
-  auto allColumns = values.getAllColumns();
-
-  // Create a JavaScript object to hold the values
+// Create a single object with lazy 'old' and 'new' properties 
+jsg::JsObject SqlStorage::createRowValuesObject(jsg::Lock& js, 
+                                               SqliteDatabase::LazyRowValues& oldValues,
+                                               SqliteDatabase::LazyRowValues& newValues) {
+  // Create the main values object
   jsg::JsObject result = js.obj();
-
-  // Add each column to the object
-  for (auto& column : allColumns) {
-    SqlValue value;
-
-    KJ_SWITCH_ONEOF(column.value) {
-      KJ_CASE_ONEOF(str, kj::String) {
-        value.emplace(str.asPtr());
+  
+  // Set up V8 context and isolate
+  auto context = js.v8Context();
+  auto isolate = js.v8Isolate;
+  
+  // Create a struct to hold pointers to both value sets
+  struct LazyRowData {
+    SqliteDatabase::LazyRowValues* oldValues;
+    SqliteDatabase::LazyRowValues* newValues;
+    
+    LazyRowData(SqliteDatabase::LazyRowValues* old, SqliteDatabase::LazyRowValues* nw)
+      : oldValues(old), newValues(nw) {}
+  };
+  
+  // Pass both values to JavaScript
+  auto lazyRowData = new LazyRowData(&oldValues, &newValues);
+  
+  // Define the 'old' property getter
+  v8::Local<v8::Name> oldKey = v8::String::NewFromUtf8(isolate, "old").ToLocalChecked();
+  v8::Local<v8::Function> oldGetter = v8::Function::New(
+    context,
+    [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      v8::Isolate* isolate = info.GetIsolate();
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::Context> context = isolate->GetCurrentContext();
+      
+      // Get the values pointer from the external data
+      v8::Local<v8::External> external = info.Data().As<v8::External>();
+      auto data = static_cast<LazyRowData*>(external->Value());
+      
+      // Create an object with the values
+      v8::Local<v8::Object> oldObj = v8::Object::New(isolate);
+      
+      // Only extract if there are values
+      if (!data->oldValues->isEmpty()) {
+        // Extract all columns lazily
+        auto allColumns = data->oldValues->getAllColumns();
+        
+        // Add each column to the result object
+        for (auto& column : allColumns) {
+          // Get a v8 string for the column name
+          v8::Local<v8::String> colName = v8::String::NewFromUtf8(
+            isolate, column.name.cStr()).ToLocalChecked();
+          
+          // Convert the value to a v8 value
+          v8::Local<v8::Value> jsValue;
+          
+          KJ_SWITCH_ONEOF(column.value) {
+            KJ_CASE_ONEOF(str, kj::String) {
+              jsValue = v8::String::NewFromUtf8(isolate, str.cStr()).ToLocalChecked();
+            }
+            KJ_CASE_ONEOF(num, double) {
+              jsValue = v8::Number::New(isolate, num);
+            }
+            KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
+              auto buffer = v8::ArrayBuffer::New(isolate, blob.size());
+              auto backingStore = buffer->GetBackingStore();
+              memcpy(backingStore->Data(), blob.begin(), blob.size());
+              jsValue = buffer;
+            }
+            KJ_CASE_ONEOF(null, decltype(nullptr)) {
+              jsValue = v8::Null(isolate);
+            }
+          }
+          
+          // Set the property
+          oldObj->Set(context, colName, jsValue).Check();
+        }
       }
-      KJ_CASE_ONEOF(num, double) {
-        value.emplace(num);
+      
+      // Return the old values object
+      info.GetReturnValue().Set(oldObj);
+    },
+    v8::External::New(isolate, lazyRowData)
+  ).ToLocalChecked();
+  
+  // Define the 'new' property getter
+  v8::Local<v8::Name> newKey = v8::String::NewFromUtf8(isolate, "new").ToLocalChecked();
+  v8::Local<v8::Function> newGetter = v8::Function::New(
+    context,
+    [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      v8::Isolate* isolate = info.GetIsolate();
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::Context> context = isolate->GetCurrentContext();
+      
+      // Get the values pointer from the external data
+      v8::Local<v8::External> external = info.Data().As<v8::External>();
+      auto data = static_cast<LazyRowData*>(external->Value());
+      
+      // Create an object with the values
+      v8::Local<v8::Object> newObj = v8::Object::New(isolate);
+      
+      // Only extract if there are values
+      if (!data->newValues->isEmpty()) {
+        // Extract all columns lazily
+        auto allColumns = data->newValues->getAllColumns();
+        
+        // Add each column to the result object
+        for (auto& column : allColumns) {
+          // Get a v8 string for the column name
+          v8::Local<v8::String> colName = v8::String::NewFromUtf8(
+            isolate, column.name.cStr()).ToLocalChecked();
+          
+          // Convert the value to a v8 value
+          v8::Local<v8::Value> jsValue;
+          
+          KJ_SWITCH_ONEOF(column.value) {
+            KJ_CASE_ONEOF(str, kj::String) {
+              jsValue = v8::String::NewFromUtf8(isolate, str.cStr()).ToLocalChecked();
+            }
+            KJ_CASE_ONEOF(num, double) {
+              jsValue = v8::Number::New(isolate, num);
+            }
+            KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
+              auto buffer = v8::ArrayBuffer::New(isolate, blob.size());
+              auto backingStore = buffer->GetBackingStore();
+              memcpy(backingStore->Data(), blob.begin(), blob.size());
+              jsValue = buffer;
+            }
+            KJ_CASE_ONEOF(null, decltype(nullptr)) {
+              jsValue = v8::Null(isolate);
+            }
+          }
+          
+          // Set the property
+          newObj->Set(context, colName, jsValue).Check();
+        }
       }
-      KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
-        value.emplace(kj::heapArray(blob.asPtr()));
-      }
-      KJ_CASE_ONEOF(null, decltype(nullptr)) {
-        // leave value null
-      }
-    }
-
-    result.set(js, column.name, wrapSqlValue(js, kj::mv(value)));
-  }
-
+      
+      // Return the new values object
+      info.GetReturnValue().Set(newObj);
+    },
+    v8::External::New(isolate, lazyRowData)
+  ).ToLocalChecked();
+  
+  // Set up the property descriptors on the values object
+  v8::Local<v8::Object> valuesObj = result;
+  
+  // Define the 'old' and 'new' properties
+  v8::PropertyDescriptor oldDesc(oldGetter, v8::Undefined(isolate));
+  oldDesc.set_enumerable(true);
+  oldDesc.set_configurable(true);
+  valuesObj->DefineProperty(context, oldKey, oldDesc).Check();
+  
+  v8::PropertyDescriptor newDesc(newGetter, v8::Undefined(isolate));
+  newDesc.set_enumerable(true);
+  newDesc.set_configurable(true);
+  valuesObj->DefineProperty(context, newKey, newDesc).Check();
+  
   return result;
-}
-
-int SqlStorage::getRowExtractionCount(SqliteDatabase::LazyRowValues& values) {
-  return values.getExtractionCount();
 }
 
 void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback) {
@@ -143,7 +258,7 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
   auto& db = getDb(js);
 
   // Set the update hook with a direct callback that executes immediately
-  // Re-entrancy protection is now handled at the SQLite level with the executingUpdateHook flag
+  // Re-entrancy protection is now handled at the SQLite level
   db.setUpdateHook(SqliteDatabase::UpdateHookCallback(
       [this](SqliteDatabase::UpdateOperation op, kj::StringPtr table, int64_t rowid,
              SqliteDatabase::LazyRowValues& oldValues, SqliteDatabase::LazyRowValues& newValues) {
@@ -160,7 +275,7 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
       auto callbackCopy = callback.addRef(lock);
 
       // Build the arguments for the JavaScript callback
-      v8::Local<v8::Value> args[5];
+      v8::Local<v8::Value> args[4];
 
       // Wrap everything in a try-catch to handle JavaScript exceptions
       try {
@@ -175,166 +290,16 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
 
         args[1] = lock.str(tableCopy);                   // table name
         args[2] = lock.num(static_cast<double>(rowid));  // rowid as double
+        
+        // Create a single values object with lazy 'old' and 'new' properties
+        args[3] = createRowValuesObject(lock, oldValues, newValues);
+        
       } catch (jsg::JsExceptionThrown& e) {
         // Catch JavaScript exceptions but allow the transaction to continue
         // This prevents the worker from crashing when JS exceptions occur in update hooks
         KJ_LOG(WARNING, "JavaScript exception while preparing update hook callback arguments");
         return;  // Exit the callback without calling the JavaScript function
       }
-
-      // Check if we're running the sql-lazy-test
-      bool isLazyTest = tableCopy == "lazy_test";
-      
-      // Create different wrappers based on which test is running
-      auto makeValuesWrapper = [&](SqliteDatabase::LazyRowValues& values) -> jsg::JsObject {
-        jsg::JsObject obj = lock.obj();
-        
-        // Special case: For INSERT old values and DELETE new values, return an empty object
-        // for backward compatibility with existing tests
-        if (values.isEmpty() || values.getColumnCount() == 0) {
-          return obj;  // Return empty object with no properties for backward compatibility
-        }
-        
-        if (isLazyTest) {
-          // LAZY-TEST VERSION: Use lazy getters (column functions) for the lazy-test
-          // First pass to collect names without extracting values
-          for (int i = 0; i < values.getColumnCount(); i++) {
-            kj::String columnName = kj::str("column", i);
-            
-            // Create a data structure to hold our column index and values
-            struct ColumnData {
-              SqliteDatabase::LazyRowValues* values;
-              int index;
-              
-              ColumnData(SqliteDatabase::LazyRowValues* v, int i) : values(v), index(i) {}
-            };
-            
-            // Use a raw pointer - it will only be used during the callback
-            auto columnData = new ColumnData(&values, i);
-            
-            // Create the column access function that will only extract when called
-            v8::Local<v8::Function> getter = v8::Function::New(
-                lock.v8Context(),
-                [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-                  v8::Isolate* isolate = info.GetIsolate();
-                  v8::HandleScope scope(isolate);
-                  
-                  // Get column data
-                  v8::Local<v8::External> dataExt = info.Data().As<v8::External>();
-                  auto data = static_cast<ColumnData*>(dataExt->Value());
-                  
-                  // Extract the column value lazily
-                  auto column = data->values->getColumn(data->index);
-                  
-                  // Convert the value to JavaScript
-                  KJ_SWITCH_ONEOF(column.value) {
-                    KJ_CASE_ONEOF(str, kj::String) {
-                      info.GetReturnValue().Set(
-                          v8::String::NewFromUtf8(isolate, str.cStr()).ToLocalChecked());
-                    }
-                    KJ_CASE_ONEOF(num, double) {
-                      info.GetReturnValue().Set(v8::Number::New(isolate, num));
-                    }
-                    KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
-                      auto buffer = v8::ArrayBuffer::New(isolate, blob.size());
-                      auto backingStore = buffer->GetBackingStore();
-                      memcpy(backingStore->Data(), blob.begin(), blob.size());
-                      info.GetReturnValue().Set(buffer);
-                    }
-                    KJ_CASE_ONEOF(null, decltype(nullptr)) {
-                      info.GetReturnValue().SetNull();
-                    }
-                  }
-                },
-                v8::External::New(lock.v8Isolate, columnData)).ToLocalChecked();
-                
-            // Add the function as a property
-            v8::Local<v8::Object>(obj)->Set(
-                lock.v8Context(),
-                v8::String::NewFromUtf8(lock.v8Isolate, columnName.cStr()).ToLocalChecked(),
-                getter).Check();
-          }
-          
-          // Only add extraction count for objects that have columns
-          if (values.getColumnCount() > 0) {
-            // Store pointer to values for getter use
-            auto countData = new SqliteDatabase::LazyRowValues*(&values);
-            
-            v8::Local<v8::Function> countFn = v8::Function::New(
-                lock.v8Context(),
-                [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-                  v8::Isolate* isolate = info.GetIsolate();
-                  
-                  // Get the values pointer
-                  v8::Local<v8::External> dataExt = info.Data().As<v8::External>();
-                  auto valuesPtr = *static_cast<SqliteDatabase::LazyRowValues**>(dataExt->Value());
-                  
-                  // Return the extraction count
-                  info.GetReturnValue().Set(
-                      v8::Number::New(isolate, valuesPtr->getExtractionCount()));
-                },
-                v8::External::New(lock.v8Isolate, countData)).ToLocalChecked();
-                
-            v8::Local<v8::Object>(obj)->Set(
-                lock.v8Context(),
-                v8::String::NewFromUtf8(lock.v8Isolate, "__extractionCount").ToLocalChecked(),
-                countFn).Check();
-          }
-        } else {
-          // NON-LAZY-TEST VERSION: Directly extract values for backward compatibility
-          // with the existing SQL test which expects direct properties
-          for (int i = 0; i < values.getColumnCount(); i++) {
-            kj::String columnName = kj::str("column", i);
-            
-            // Extract the column value eagerly for backward compatibility
-            auto column = values.getColumn(i);
-            
-            // Create direct property with the value
-            v8::Local<v8::Name> propName = v8::String::NewFromUtf8(
-                lock.v8Isolate, columnName.cStr()).ToLocalChecked();
-                
-            // Convert the value to JavaScript
-            v8::Local<v8::Value> propValue;
-            KJ_SWITCH_ONEOF(column.value) {
-              KJ_CASE_ONEOF(str, kj::String) {
-                propValue = v8::String::NewFromUtf8(
-                    lock.v8Isolate, str.cStr()).ToLocalChecked();
-              }
-              KJ_CASE_ONEOF(num, double) {
-                propValue = v8::Number::New(lock.v8Isolate, num);
-              }
-              KJ_CASE_ONEOF(blob, kj::Array<const byte>) {
-                auto buffer = v8::ArrayBuffer::New(lock.v8Isolate, blob.size());
-                auto backingStore = buffer->GetBackingStore();
-                memcpy(backingStore->Data(), blob.begin(), blob.size());
-                propValue = buffer;
-              }
-              KJ_CASE_ONEOF(null, decltype(nullptr)) {
-                propValue = v8::Null(lock.v8Isolate);
-              }
-            }
-            
-            // Set the property directly
-            v8::Local<v8::Object>(obj)->Set(
-                lock.v8Context(), propName, propValue).Check();
-          }
-          
-          // Add extraction count as a Number for compatibility tests that don't access it
-          v8::Local<v8::Object>(obj)->Set(
-              lock.v8Context(),
-              v8::String::NewFromUtf8(lock.v8Isolate, "__extractionCount").ToLocalChecked(),
-              v8::Number::New(lock.v8Isolate, values.getExtractionCount())).Check();
-        }
-        
-        return obj;
-      };
-      
-      // Create row objects based on test type
-      jsg::JsObject oldObj = makeValuesWrapper(oldValues);
-      jsg::JsObject newObj = makeValuesWrapper(newValues);
-
-      args[3] = oldObj;
-      args[4] = newObj;
 
       // Call the JavaScript callback with the arguments
       auto handle = callbackCopy.getHandle(lock);
@@ -344,7 +309,7 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::V8Ref<v8::Function> callback)
       v8::TryCatch tryCatch(lock.v8Isolate);
       
       // Call the callback and ignore the result
-      handle->Call(lock.v8Context(), undefined, 5, args);
+      handle->Call(lock.v8Context(), undefined, 4, args);
       
       // Check if an exception occurred
       if (tryCatch.HasCaught()) {

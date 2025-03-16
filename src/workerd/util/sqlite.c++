@@ -1269,48 +1269,35 @@ SqliteDatabase::ColumnValue SqliteDatabase::LazyRowValues::extractValue(sqlite3_
   }
 }
 
-SqliteDatabase::Column SqliteDatabase::LazyRowValues::getColumn(int columnIndex) {
-  if (isEmpty() || columnIndex < 0 || columnIndex >= columnCount) {
-    return { kj::str("invalid"), nullptr };
-  }
-  
-  KJ_DBG("LazyRowValues: Extracting single column", columnIndex, 
-         isOldValues ? "old values" : "new values");
-  
-  // Increment extraction counter for testing
-  extractionCount++;
-  
-  SqliteDatabase::Column col;
-  // Generate column name (columnN)
-  col.name = kj::str("column", columnIndex);
-  
-  // Extract the value based on whether this is for old or new values
-  sqlite3_value* sqliteValue = nullptr;
-  if (isOldValues) {
-    ::sqlite3_preupdate_old(db, columnIndex, &sqliteValue);
-  } else {
-    ::sqlite3_preupdate_new(db, columnIndex, &sqliteValue);
-  }
-  
-  col.value = extractValue(sqliteValue);
-  return col;
-}
-
 SqliteDatabase::RowData SqliteDatabase::LazyRowValues::getAllColumns() {
   if (isEmpty()) {
     return kj::Array<SqliteDatabase::Column>(0);
   }
   
-  KJ_DBG("LazyRowValues: Extracting ALL columns", columnCount, 
+  KJ_DBG("LazyRowValues: Extracting ALL columns at row level", columnCount, 
          isOldValues ? "old values" : "new values");
   
   kj::Vector<SqliteDatabase::Column> columns(columnCount);
   
-  // Extract all columns
+  // Extract all columns at once
   for (int i = 0; i < columnCount; i++) {
-    columns.add(getColumn(i));
+    SqliteDatabase::Column col;
+    // Generate column name (columnN)
+    col.name = kj::str("column", i);
+    
+    // Extract the value based on whether this is for old or new values
+    sqlite3_value* sqliteValue = nullptr;
+    if (isOldValues) {
+      ::sqlite3_preupdate_old(db, i, &sqliteValue);
+    } else {
+      ::sqlite3_preupdate_new(db, i, &sqliteValue);
+    }
+    
+    col.value = extractValue(sqliteValue);
+    columns.add(kj::mv(col));
   }
   
+  // Return the result
   return columns.releaseAsArray();
 }
 

@@ -1098,17 +1098,22 @@ async function test(state) {
   const updateEvents = [];
 
   // Set update hook
-  sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+  sql.setUpdateHook((operation, table, rowid, values) => {
     console.log('UPDATE HOOK CALLED:', { operation, table, rowid });
-    console.log('Old values:', oldValues);
-    console.log('New values:', newValues);
+    
+    // Access values for testing - this will trigger lazy loading
+    let oldData = operation === 'insert' ? {} : values.old; 
+    let newData = operation === 'delete' ? {} : values.new;
+    
+    console.log('Old values:', oldData);
+    console.log('New values:', newData);
 
     updateEvents.push({
       operation,
       table,
       rowid,
-      oldValues,
-      newValues
+      oldValues: oldData,
+      newValues: newData
     });
 
     // While it's technically possible to call SQLite from within the hook,
@@ -1268,7 +1273,7 @@ async function test(state) {
     let hasReentrancyProtection = false;
 
     // Set up a hook that attempts a single SQL operation to test re-entrancy protection
-    sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+    sql.setUpdateHook((operation, table, rowid, values) => {
       // Attempt to execute a SQL operation from within the hook
       try {
         // Try to execute a simple SQL statement
@@ -1330,15 +1335,14 @@ async function test(state) {
     let hookQueue = [];
     
     // Set up update hook that simply adds events to the queue
-    sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+    sql.setUpdateHook((operation, table, rowid, values) => {
       if (table === 'rollback_test') {
         // Add the event to our queue
         hookQueue.push({
           operation,
           table,
           rowid,
-          oldValues,
-          newValues
+          values
         });
         
         console.log(`HOOK for ${operation} on ${table} row ${rowid} added to queue`);
@@ -1429,7 +1433,7 @@ async function test(state) {
     let continuedAfterException = false;
     
     // Set up an update hook that throws an uncaught exception
-    sql.setUpdateHook((operation, table, rowid, oldValues, newValues) => {
+    sql.setUpdateHook((operation, table, rowid, values) => {
       if (table === 'exception_test') {
         console.log(`Hook triggered for ${operation} on ${table}. About to throw...`);
         // Throw an exception that is not caught within the hook
