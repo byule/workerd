@@ -93,29 +93,29 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
 void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback) {
   // Store the JavaScript callback
   updateHookCallback = kj::mv(callback);
-  
+
   // Get the SQLite database instance
   auto& db = getDb(js);
-  
+
   // Set up the update hook using the abstracted SqliteDatabase interface
-  db.setUpdateHook([this](SqliteDatabase::UpdateOperation operation, 
-                       kj::StringPtr dbName, 
-                       kj::StringPtr tableName, 
+  db.setUpdateHook([this](SqliteDatabase::UpdateOperation operation,
+                       kj::StringPtr dbName,
+                       kj::StringPtr tableName,
                        int64_t rowid) {
     // Skip if no V8 context is active
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
     if (isolate == nullptr) {
       return;
     }
-      
+
     // Get the current JS lock
     jsg::Lock& js = jsg::Lock::from(isolate);
-    
-    // Skip if no callback is registered  
+
+    // Skip if no callback is registered
     KJ_IF_SOME(callback, updateHookCallback) {
       // Convert the operation to a string for JavaScript
       kj::String opStr;
-      
+
       // Map operation enum to strings
       switch (operation) {
         case SqliteDatabase::UpdateOperation::INSERT:
@@ -130,9 +130,13 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::St
         default:
           return; // Unknown operation, ignore
       }
-      
-      // Call the JavaScript callback with rowid, tableName, and operation
-      callback(js, rowid, kj::str(tableName), kj::mv(opStr));
+
+      // Callback into Javascript
+      try {
+        callback(js, rowid, kj::str(tableName), kj::mv(opStr));
+      } catch (jsg::JsExceptionThrown& e) {
+        // Just swallow JS exceptions and let the sql operation continue
+      }
     }
   });
 }
@@ -140,7 +144,7 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::St
 void SqlStorage::clearUpdateHook(jsg::Lock& js) {
   // Clear the JavaScript callback
   updateHookCallback = kj::none;
-  
+
   // Clear the SQLite hook
   getDb(js).clearUpdateHook();
 }
