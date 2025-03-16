@@ -265,6 +265,26 @@ class SqliteDatabase {
       rollbackCallbacks.add(kj::mv(callback));
     }
   }
+  
+  // Enum representing the type of database update operation
+  enum class UpdateOperation {
+    INSERT,
+    UPDATE,
+    DELETE
+  };
+  
+  // Register a callback to be invoked before a row is modified.
+  // The callback receives:
+  // - The operation type (INSERT, UPDATE, DELETE)
+  // - The name of the database (usually "main")
+  // - The name of the table being modified
+  // - The rowid of the row being modified
+  // 
+  // This hook uses SQLite's preupdate hook functionality.
+  void setUpdateHook(kj::Function<void(UpdateOperation, kj::StringPtr, kj::StringPtr, int64_t)> callback);
+  
+  // Clear the update hook (no further callbacks will be invoked)
+  void clearUpdateHook();
 
  private:
   const Vfs& vfs;
@@ -294,6 +314,9 @@ class SqliteDatabase {
 
   // Callbacks registered with onRollback that haven't been committed nor rolled back yet.
   kj::Vector<kj::Function<void()>> rollbackCallbacks;
+  
+  // Update hook callback
+  kj::Maybe<kj::Function<void(UpdateOperation, kj::StringPtr, kj::StringPtr, int64_t)>> updateHookCallback;
 
   struct Savepoint {
     kj::String name;

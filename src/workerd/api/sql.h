@@ -35,6 +35,13 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
 
   double getDatabaseSize(jsg::Lock& js);
+  
+  // Sets a callback function to be called when database updates occur
+  // The callback receives: rowid, tableName, operation ("INSERT", "UPDATE", "DELETE")
+  void setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback);
+  
+  // Clears the update hook callback
+  void clearUpdateHook(jsg::Lock& js);
 
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
@@ -46,6 +53,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
       // 'ingest' functionality is still experimental-only
       JSG_METHOD(ingest);
+      
+      // Update hook API is experimental-only
+      JSG_METHOD(setUpdateHook);
+      JSG_METHOD(clearUpdateHook);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -63,6 +74,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  private:
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(storage);
+    visitor.visit(updateHookCallback);
   }
 
   bool isAllowedName(kj::StringPtr name) const override;
@@ -80,6 +92,9 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   kj::Maybe<uint> pageSize;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaPageCount;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaGetMaxPageCount;
+  
+  // JavaScript callback for update hooks
+  kj::Maybe<jsg::Function<void(int64_t, kj::String, kj::String)>> updateHookCallback;
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {

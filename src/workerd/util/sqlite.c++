@@ -508,6 +508,9 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 }
 
 SqliteDatabase::~SqliteDatabase() noexcept(false) {
+  // Make sure to clear the update hook to avoid callback after destruction
+  clearUpdateHook();
+  
   sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
 
   auto err = sqlite3_close(db);
@@ -825,6 +828,53 @@ void SqliteDatabase::reset() {
 
   KJ_IF_SOME(resetCb, afterResetCallback) {
     resetCb(*this);
+  }
+}
+
+void SqliteDatabase::setUpdateHook(
+    kj::Function<void(UpdateOperation, kj::StringPtr, kj::StringPtr, int64_t)> callback) {
+  updateHookCallback = kj::mv(callback);
+  
+  KJ_IF_SOME(db, maybeDb) {
+    // Register the hook with SQLite
+    sqlite3_preupdate_hook(&db, 
+      [](void* userData, sqlite3*, int op, const char* dbName, 
+         const char* tableName, sqlite3_int64 rowid, sqlite3_int64) {
+        auto& self = *reinterpret_cast<SqliteDatabase*>(userData);
+        
+        // Skip if no callback is registered
+        KJ_IF_SOME(callback, self.updateHookCallback) {
+          UpdateOperation operation;
+          
+          // Map SQLite operation codes to our enum
+          switch (op) {
+            case SQLITE_INSERT:
+              operation = UpdateOperation::INSERT;
+              break;
+            case SQLITE_UPDATE:
+              operation = UpdateOperation::UPDATE;
+              break;
+            case SQLITE_DELETE:
+              operation = UpdateOperation::DELETE;
+              break;
+            default:
+              return; // Unknown operation, ignore
+          }
+          
+          // Call user callback with our abstracted interface
+          callback(operation, dbName, tableName, rowid);
+        }
+      }, this);
+  }
+}
+
+void SqliteDatabase::clearUpdateHook() {
+  // Clear our callback
+  updateHookCallback = kj::none;
+  
+  // Unregister from SQLite
+  KJ_IF_SOME(db, maybeDb) {
+    sqlite3_preupdate_hook(&db, nullptr, nullptr);
   }
 }
 

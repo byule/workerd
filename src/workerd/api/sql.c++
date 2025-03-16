@@ -90,6 +90,62 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   return pages * getPageSize(db);
 }
 
+void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback) {
+  // Store the JavaScript callback
+  updateHookCallback = kj::mv(callback);
+  
+  // Get the SQLite database instance
+  auto& db = getDb(js);
+  
+  // Set up the update hook using the abstracted SqliteDatabase interface
+  db.setUpdateHook([this](SqliteDatabase::UpdateOperation operation, 
+                       kj::StringPtr dbName, 
+                       kj::StringPtr tableName, 
+                       int64_t rowid) {
+    // Skip if no V8 context is active
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    if (isolate == nullptr) {
+      return;
+    }
+      
+    // Get the current JS lock
+    jsg::Lock& js = jsg::Lock::from(isolate);
+    
+    // Skip if no callback is registered  
+    KJ_IF_SOME(callback, updateHookCallback) {
+      // Convert the operation to a string for JavaScript
+      kj::String opStr;
+      
+      // Map operation enum to strings
+      switch (operation) {
+        case SqliteDatabase::UpdateOperation::INSERT:
+          opStr = kj::str("INSERT");
+          break;
+        case SqliteDatabase::UpdateOperation::UPDATE:
+          opStr = kj::str("UPDATE");
+          break;
+        case SqliteDatabase::UpdateOperation::DELETE:
+          opStr = kj::str("DELETE");
+          break;
+        default:
+          return; // Unknown operation, ignore
+      }
+      
+      // Call the JavaScript callback with rowid, tableName, and operation
+      callback(js, rowid, kj::str(tableName), kj::mv(opStr));
+    }
+  });
+}
+
+void SqlStorage::clearUpdateHook(jsg::Lock& js) {
+  // Clear the JavaScript callback
+  updateHookCallback = kj::none;
+  
+  // Clear the SQLite hook
+  getDb(js).clearUpdateHook();
+}
+
+
 bool SqlStorage::isAllowedName(kj::StringPtr name) const {
   return !name.startsWith("_cf_");
 }
@@ -392,6 +448,7 @@ void SqlStorage::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
     tracker.trackFieldWithSize(
         "IoPtr<SqllitDatabase::Statement>", sizeof(IoPtr<SqliteDatabase::Statement>));
   }
+  tracker.trackField("updateHookCallback", updateHookCallback);
 }
 
 }  // namespace workerd::api
