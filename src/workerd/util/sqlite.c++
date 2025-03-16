@@ -174,6 +174,9 @@ class SqliteCallScope {
     /* SQLITE_MISUSE doesn't put error info on the database object, so check it separately */      \
     KJ_ASSERT(_ec != SQLITE_MISUSE, "SQLite misused: " #code, ##__VA_ARGS__);                      \
     if (_ec == SQLITE_IOERR) sqliteCallScope.rethrowVfsError();                                    \
+    if (_ec == SQLITE_LOCKED) {                                                                    \
+      /* SQLITE_LOCKED errors are handled by the SQLITE_REQUIRE below */                           \
+    }                                                                                              \
     SQLITE_REQUIRE(_ec == SQLITE_OK, _ec, dbErrorMessage(_ec, db), ##__VA_ARGS__);                 \
   } while (false)
 
@@ -183,6 +186,9 @@ class SqliteCallScope {
   do {                                                                                             \
     KJ_ASSERT(error != SQLITE_MISUSE, "SQLite misused: " code, ##__VA_ARGS__);                     \
     if (error == SQLITE_IOERR) sqliteCallScope.rethrowVfsError();                                  \
+    if (error == SQLITE_LOCKED) {                                                                  \
+      /* SQLITE_LOCKED errors are handled by the SQLITE_REQUIRE below */                           \
+    }                                                                                              \
     SQLITE_REQUIRE(error == SQLITE_OK, error, dbErrorMessage(error, db), ##__VA_ARGS__);           \
   } while (false);
 
@@ -510,7 +516,7 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 SqliteDatabase::~SqliteDatabase() noexcept(false) {
   // Make sure to clear the update hook to avoid callback after destruction
   clearUpdateHook();
-  
+
   sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
 
   auto err = sqlite3_close(db);
@@ -834,18 +840,18 @@ void SqliteDatabase::reset() {
 void SqliteDatabase::setUpdateHook(
     kj::Function<void(UpdateOperation, kj::StringPtr, kj::StringPtr, int64_t)> callback) {
   updateHookCallback = kj::mv(callback);
-  
+
   KJ_IF_SOME(db, maybeDb) {
     // Register the hook with SQLite
-    sqlite3_preupdate_hook(&db, 
-      [](void* userData, sqlite3*, int op, const char* dbName, 
+    sqlite3_preupdate_hook(&db,
+      [](void* userData, sqlite3*, int op, const char* dbName,
          const char* tableName, sqlite3_int64 rowid, sqlite3_int64) {
         auto& self = *reinterpret_cast<SqliteDatabase*>(userData);
-        
+
         // Skip if no callback is registered
         KJ_IF_SOME(callback, self.updateHookCallback) {
           UpdateOperation operation;
-          
+
           // Map SQLite operation codes to our enum
           switch (op) {
             case SQLITE_INSERT:
@@ -860,9 +866,13 @@ void SqliteDatabase::setUpdateHook(
             default:
               return; // Unknown operation, ignore
           }
-          
+
           // Call user callback with our abstracted interface
-          callback(operation, dbName, tableName, rowid);
+          try {
+            callback(operation, dbName, tableName, rowid);
+          } catch (kj::Exception& e) {
+            throw; // rethrow to maintain behavior
+          }
         }
       }, this);
   }
@@ -871,7 +881,7 @@ void SqliteDatabase::setUpdateHook(
 void SqliteDatabase::clearUpdateHook() {
   // Clear our callback
   updateHookCallback = kj::none;
-  
+
   // Unregister from SQLite
   KJ_IF_SOME(db, maybeDb) {
     sqlite3_preupdate_hook(&db, nullptr, nullptr);

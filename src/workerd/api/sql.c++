@@ -17,6 +17,9 @@ namespace workerd::api {
 // queries containing dynamic content or excessively large one-off queries.
 static constexpr uint SQL_STATEMENT_CACHE_MAX_SIZE = 1024 * 1024;
 
+// Initialize the static thread local flag
+thread_local bool SqlStorage::insideUpdateHook = false;
+
 SqlStorage::SqlStorage(jsg::Ref<DurableObjectStorage> storage)
     : storage(kj::mv(storage)),
       statementCache(IoContext::current().addObject(kj::heap<StatementCache>())) {}
@@ -30,7 +33,15 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
   // is a one-off, internalizing it (which moves it to the old generation) shouldn't hurt.
   querySql = querySql.internalize(js);
 
+  // Check for re-entrancy before proceeding with SQL operations
+  if (insideUpdateHook) {
+    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in exec()", js.toString(querySql));
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto& db = getDb(js);
+
   auto& statementCache = *this->statementCache;
 
   kj::Rc<CachedStatement>& slot = statementCache.map.findOrCreate(querySql, [&]() {
@@ -72,18 +83,41 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
 }
 
 SqlStorage::IngestResult SqlStorage::ingest(jsg::Lock& js, kj::String querySql) {
+  // Check for re-entrancy before proceeding with SQL operations
+  if (insideUpdateHook) {
+    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in ingest()", querySql);
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
+  auto& db = getDb(js);
+
   SqliteDatabase::Regulator& regulator = *this;
-  auto result = getDb(js).ingestSql(regulator, querySql);
+  auto result = db.ingestSql(regulator, querySql);
   return IngestResult(
       kj::str(result.remainder), result.rowsRead, result.rowsWritten, result.statementCount);
 }
 
 jsg::Ref<SqlStorage::Statement> SqlStorage::prepare(jsg::Lock& js, jsg::JsString query) {
+  // Check for re-entrancy before proceeding with SQL operations
+  if (insideUpdateHook) {
+    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in prepare()", js.toString(query));
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   return jsg::alloc<Statement>(js, JSG_THIS, query);
 }
 
 double SqlStorage::getDatabaseSize(jsg::Lock& js) {
+  // Check for re-entrancy
+  if (insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto& db = getDb(js);
+
   int64_t pages = execMemoized(db, pragmaPageCount,
       "select (select * from pragma_page_count) - (select * from pragma_freelist_count);")
                       .getInt64(0);
@@ -91,11 +125,17 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
 }
 
 void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback) {
-  // Store the JavaScript callback
-  updateHookCallback = kj::mv(callback);
+  // Check for re-entrancy
+  if (insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
 
   // Get the SQLite database instance
   auto& db = getDb(js);
+
+  // Store the JavaScript callback
+  updateHookCallback = kj::mv(callback);
 
   // Set up the update hook using the abstracted SqliteDatabase interface
   db.setUpdateHook([this](SqliteDatabase::UpdateOperation operation,
@@ -113,6 +153,15 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::St
 
     // Skip if no callback is registered
     KJ_IF_SOME(callback, updateHookCallback) {
+      // Set the re-entrancy prevention flag
+      KJ_ASSERT(!insideUpdateHook, "Nested update hook detected");
+      insideUpdateHook = true;
+
+      // Use KJ_DEFER to ensure the flag is reset even if an exception is thrown
+      KJ_DEFER({
+        insideUpdateHook = false;
+      });
+
       // Convert the operation to a string for JavaScript
       kj::String opStr;
 
@@ -136,17 +185,28 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::St
         callback(js, rowid, kj::str(tableName), kj::mv(opStr));
       } catch (jsg::JsExceptionThrown& e) {
         // Just swallow JS exceptions and let the sql operation continue
+      } catch (kj::Exception& e) {
+        throw; // Rethrow KJ exceptions
       }
     }
   });
 }
 
 void SqlStorage::clearUpdateHook(jsg::Lock& js) {
+  // Check for re-entrancy
+  if (insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
+  // Get the database instance
+  auto& db = getDb(js);
+
   // Clear the JavaScript callback
   updateHookCallback = kj::none;
 
   // Clear the SQLite hook
-  getDb(js).clearUpdateHook();
+  db.clearUpdateHook();
 }
 
 
@@ -243,6 +303,12 @@ void SqlStorage::Cursor::initColumnNames(jsg::Lock& js, State& stateRef) {
 }
 
 double SqlStorage::Cursor::getRowsRead() {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   KJ_IF_SOME(st, state) {
     return static_cast<double>(st->query.getRowsRead());
   } else {
@@ -251,6 +317,12 @@ double SqlStorage::Cursor::getRowsRead() {
 }
 
 double SqlStorage::Cursor::getRowsWritten() {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   KJ_IF_SOME(st, state) {
     return static_cast<double>(st->query.getRowsWritten());
   } else {
@@ -259,6 +331,12 @@ double SqlStorage::Cursor::getRowsWritten() {
 }
 
 SqlStorage::Cursor::RowIterator::Next SqlStorage::Cursor::next(jsg::Lock& js) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto self = JSG_THIS;
   auto maybeRow = rowIteratorNext(js, self);
   bool done = maybeRow == kj::none;
@@ -269,6 +347,12 @@ SqlStorage::Cursor::RowIterator::Next SqlStorage::Cursor::next(jsg::Lock& js) {
 }
 
 jsg::JsArray SqlStorage::Cursor::toArray(jsg::Lock& js) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto self = JSG_THIS;
   v8::LocalVector<v8::Value> results(js.v8Isolate);
   for (;;) {
@@ -284,6 +368,12 @@ jsg::JsArray SqlStorage::Cursor::toArray(jsg::Lock& js) {
 }
 
 jsg::JsValue SqlStorage::Cursor::one(jsg::Lock& js) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto self = JSG_THIS;
   auto result = JSG_REQUIRE_NONNULL(rowIteratorNext(js, self), Error,
       "Expected exactly one result from SQL query, but got no results.");
@@ -300,10 +390,22 @@ jsg::JsValue SqlStorage::Cursor::one(jsg::Lock& js) {
 }
 
 jsg::Ref<SqlStorage::Cursor::RowIterator> SqlStorage::Cursor::rows(jsg::Lock& js) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   return jsg::alloc<RowIterator>(JSG_THIS);
 }
 
 kj::Maybe<jsg::JsObject> SqlStorage::Cursor::rowIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   KJ_IF_SOME(values, iteratorImpl(js, obj)) {
     auto names = obj->columnNames.getHandle(js);
     jsg::JsObject result = js.obj();
@@ -318,6 +420,12 @@ kj::Maybe<jsg::JsObject> SqlStorage::Cursor::rowIteratorNext(jsg::Lock& js, jsg:
 }
 
 jsg::Ref<SqlStorage::Cursor::RawIterator> SqlStorage::Cursor::raw(jsg::Lock&) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   return jsg::alloc<RawIterator>(JSG_THIS);
 }
 
@@ -325,10 +433,22 @@ jsg::Ref<SqlStorage::Cursor::RawIterator> SqlStorage::Cursor::raw(jsg::Lock&) {
 // iterator has already been fully consumed. The resulting columns may contain duplicate entries,
 // for instance a `SELECT *` across a join of two tables that share a column name.
 jsg::JsArray SqlStorage::Cursor::getColumnNames(jsg::Lock& js) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   return columnNames.getHandle(js);
 }
 
 kj::Maybe<jsg::JsArray> SqlStorage::Cursor::rawIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj) {
+  // Check for re-entrancy into SQLite during update hook
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   KJ_IF_SOME(values, iteratorImpl(js, obj)) {
     return jsg::JsArray(v8::Array::New(js.v8Isolate, values.data(), values.size()));
   } else {
@@ -338,6 +458,12 @@ kj::Maybe<jsg::JsArray> SqlStorage::Cursor::rawIteratorNext(jsg::Lock& js, jsg::
 
 kj::Maybe<v8::LocalVector<v8::Value>> SqlStorage::Cursor::iteratorImpl(
     jsg::Lock& js, jsg::Ref<Cursor>& obj) {
+  // Check for re-entrancy
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                    "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   auto& state = *KJ_UNWRAP_OR(obj->state, {
     if (obj->canceled) {
       JSG_FAIL_REQUIRE(Error,
@@ -438,6 +564,12 @@ kj::Array<const SqliteDatabase::Query::ValuePtr> SqlStorage::Cursor::mapBindings
 
 jsg::Ref<SqlStorage::Cursor> SqlStorage::Statement::run(
     jsg::Lock& js, jsg::Arguments<BindingValue> bindings) {
+  // Check for re-entrancy
+  if (SqlStorage::insideUpdateHook) {
+    JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
+                   "This prevents potential database corruption due to SQLite re-entrancy issues.");
+  }
+
   return sqlStorage->exec(js, jsg::JsString(query.getHandle(js)), kj::mv(bindings));
 }
 

@@ -95,6 +95,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   
   // JavaScript callback for update hooks
   kj::Maybe<jsg::Function<void(int64_t, kj::String, kj::String)>> updateHookCallback;
+  
+  // Flag to track if we're currently executing inside an update hook callback
+  // Used to prevent re-entrancy into SQLite from the callback
+  static thread_local bool insideUpdateHook;
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {
