@@ -12,6 +12,27 @@
 
 namespace workerd::api {
 
+// Class to represent row values in an update hook
+class SqlUpdateHookValues final: public jsg::Object {
+public:
+  SqlUpdateHookValues(SqliteDatabase& db, SqliteDatabase::UpdateOperation operation);
+
+  // Returns the new values (for INSERT/UPDATE)
+  jsg::JsArray getNew(jsg::Lock& js);
+
+  // Returns the old values (for UPDATE/DELETE)
+  jsg::JsArray getOld(jsg::Lock& js);
+
+  JSG_RESOURCE_TYPE(SqlUpdateHookValues) {
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(new, getNew);
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(old, getOld);
+  }
+
+private:
+  SqliteDatabase& db;
+  SqliteDatabase::UpdateOperation operation;
+};
+
 class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  public:
   SqlStorage(jsg::Ref<DurableObjectStorage> storage);
@@ -37,8 +58,9 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   double getDatabaseSize(jsg::Lock& js);
   
   // Sets a callback function to be called when database updates occur
-  // The callback receives: rowid, tableName, operation ("INSERT", "UPDATE", "DELETE")
-  void setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback);
+  // The callback receives: rowid, tableName, operation ("INSERT", "UPDATE", "DELETE"), values object
+  // The values object has lazy-loaded properties 'new' and 'old' that return arrays of column values
+  void setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String, jsg::Ref<SqlUpdateHookValues>)> callback);
   
   // Clears the update hook callback
   void clearUpdateHook(jsg::Lock& js);
@@ -94,7 +116,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaGetMaxPageCount;
   
   // JavaScript callback for update hooks
-  kj::Maybe<jsg::Function<void(int64_t, kj::String, kj::String)>> updateHookCallback;
+  kj::Maybe<jsg::Function<void(int64_t, kj::String, kj::String, jsg::Ref<SqlUpdateHookValues>)>> updateHookCallback;
   
   // Flag to track if we're currently executing inside an update hook callback
   // Used to prevent re-entrancy into SQLite from the callback
@@ -367,7 +389,7 @@ struct SqlStorage::IngestResult {
   api::SqlStorage, api::SqlStorage::Statement, api::SqlStorage::Cursor,                            \
       api::SqlStorage::IngestResult, api::SqlStorage::Cursor::RowIterator,                         \
       api::SqlStorage::Cursor::RowIterator::Next, api::SqlStorage::Cursor::RawIterator,            \
-      api::SqlStorage::Cursor::RawIterator::Next
+      api::SqlStorage::Cursor::RawIterator::Next, api::SqlUpdateHookValues
 // The list of sql.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE
 
 }  // namespace workerd::api

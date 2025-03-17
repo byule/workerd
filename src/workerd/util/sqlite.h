@@ -23,6 +23,9 @@ namespace workerd {
 using kj::byte;
 using kj::uint;
 
+// SqlValue represents a value from a SQLite database
+using SqlValue = kj::OneOf<kj::Array<byte>, kj::StringPtr, double>;
+
 // Used to collect periodic metrics about queries and size of sqlite db
 class SqliteObserver {
  public:
@@ -282,6 +285,20 @@ class SqliteDatabase {
   // 
   // This hook uses SQLite's preupdate hook functionality.
   void setUpdateHook(kj::Function<void(UpdateOperation, kj::StringPtr, kj::StringPtr, int64_t)> callback);
+  
+  // Methods to access row data during an update hook callback
+  // These should ONLY be called from within an update hook callback
+  
+  // Returns the number of columns in the row being modified
+  int rowColumnCount();
+  
+  // Returns the value of a column in the row before modification (for UPDATE/DELETE)
+  // Column index must be between 0 and rowColumnCount()-1
+  kj::Maybe<kj::Maybe<SqlValue>> rowOldValue(int columnIndex);
+  
+  // Returns the value of a column in the row after modification (for INSERT/UPDATE)
+  // Column index must be between 0 and rowColumnCount()-1
+  kj::Maybe<kj::Maybe<SqlValue>> rowNewValue(int columnIndex);
   
   // Clear the update hook (no further callbacks will be invoked)
   void clearUpdateHook();

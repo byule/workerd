@@ -888,6 +888,97 @@ void SqliteDatabase::clearUpdateHook() {
   }
 }
 
+int SqliteDatabase::rowColumnCount() {
+  KJ_IF_SOME(db, maybeDb) {
+    return sqlite3_preupdate_count(&db);
+  }
+  return 0;
+}
+
+kj::Maybe<kj::Maybe<SqlValue>> SqliteDatabase::rowOldValue(int columnIndex) {
+  KJ_IF_SOME(db, maybeDb) {
+    sqlite3_value* value = nullptr;
+    int result = sqlite3_preupdate_old(&db, columnIndex, &value);
+
+    if (result != SQLITE_OK || value == nullptr) {
+      return kj::none;
+    }
+
+    // Convert SQLite value to our SqlValue type
+    switch (sqlite3_value_type(value)) {
+      case SQLITE_INTEGER: {
+        SqlValue val = static_cast<double>(sqlite3_value_int64(value));
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_FLOAT: {
+        SqlValue val = sqlite3_value_double(value);
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_TEXT: {
+        SqlValue val = kj::StringPtr(reinterpret_cast<const char*>(sqlite3_value_text(value)));
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_BLOB: {
+        const void* data = sqlite3_value_blob(value);
+        int size = sqlite3_value_bytes(value);
+        if (data != nullptr && size > 0) {
+          auto bytes = kj::heapArray<kj::byte>(size);
+          memcpy(bytes.begin(), data, size);
+          SqlValue val = kj::mv(bytes);
+          return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+        }
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::none);
+      }
+      case SQLITE_NULL:
+      default:
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::none);
+    }
+  }
+  return kj::none;
+}
+
+kj::Maybe<kj::Maybe<SqlValue>> SqliteDatabase::rowNewValue(int columnIndex) {
+  KJ_IF_SOME(db, maybeDb) {
+    sqlite3_value* value = nullptr;
+    int result = sqlite3_preupdate_new(&db, columnIndex, &value);
+
+    if (result != SQLITE_OK || value == nullptr) {
+      return kj::none;
+    }
+
+    // Convert SQLite value to our SqlValue type
+    switch (sqlite3_value_type(value)) {
+      case SQLITE_INTEGER: {
+        SqlValue val = static_cast<double>(sqlite3_value_int64(value));
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_FLOAT: {
+        SqlValue val = sqlite3_value_double(value);
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_TEXT: {
+        SqlValue val = kj::StringPtr(reinterpret_cast<const char*>(sqlite3_value_text(value)));
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+      }
+      case SQLITE_BLOB: {
+        const void* data = sqlite3_value_blob(value);
+        int size = sqlite3_value_bytes(value);
+        if (data != nullptr && size > 0) {
+          auto bytes = kj::heapArray<kj::byte>(size);
+          memcpy(bytes.begin(), data, size);
+          SqlValue val = kj::mv(bytes);
+          return kj::Maybe<kj::Maybe<SqlValue>>(kj::Maybe<SqlValue>(kj::mv(val)));
+        }
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::none);
+      }
+      case SQLITE_NULL:
+      default:
+        return kj::Maybe<kj::Maybe<SqlValue>>(kj::none);
+    }
+  }
+  return kj::none;
+}
+
 bool SqliteDatabase::isAuthorized(int actionCode,
     kj::Maybe<kj::StringPtr> param1,
     kj::Maybe<kj::StringPtr> param2,

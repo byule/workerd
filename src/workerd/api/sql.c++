@@ -10,6 +10,88 @@
 
 namespace workerd::api {
 
+// Implementation of the SqlUpdateHookValues class
+SqlUpdateHookValues::SqlUpdateHookValues(SqliteDatabase& db, SqliteDatabase::UpdateOperation operation)
+    : db(db), operation(operation) {}
+
+jsg::JsArray SqlUpdateHookValues::getNew(jsg::Lock& js) {
+  // Check if this is a DELETE operation (no new values)
+  if (operation == SqliteDatabase::UpdateOperation::DELETE) {
+    // For DELETE, there are no new values, return an empty array
+    return jsg::JsArray(v8::Array::New(js.v8Isolate, 0));
+  }
+
+  // Get the number of columns in the row
+  int columnCount = db.rowColumnCount();
+
+  v8::LocalVector<v8::Value> values(js.v8Isolate);
+  values.reserve(columnCount);
+
+  // Populate the array with all column values
+  for (int i = 0; i < columnCount; i++) {
+    KJ_IF_SOME(sqlValue, db.rowNewValue(i)) {
+      KJ_IF_SOME(value, sqlValue) {
+        KJ_SWITCH_ONEOF(value) {
+          KJ_CASE_ONEOF(bytes, kj::Array<kj::byte>) {
+            values.push_back(js.wrapBytes(kj::mv(bytes)));
+          }
+          KJ_CASE_ONEOF(text, kj::StringPtr) {
+            values.push_back(js.str(text));
+          }
+          KJ_CASE_ONEOF(number, double) {
+            values.push_back(js.num(number));
+          }
+        }
+      } else {
+        values.push_back(js.null());
+      }
+    } else {
+      values.push_back(js.null());
+    }
+  }
+
+  return jsg::JsArray(v8::Array::New(js.v8Isolate, values.data(), values.size()));
+}
+
+jsg::JsArray SqlUpdateHookValues::getOld(jsg::Lock& js) {
+  // Check if this is an INSERT operation (no old values)
+  if (operation == SqliteDatabase::UpdateOperation::INSERT) {
+    // For INSERT, there are no old values, return an empty array
+    return jsg::JsArray(v8::Array::New(js.v8Isolate, 0));
+  }
+
+  // Get the number of columns in the row
+  int columnCount = db.rowColumnCount();
+
+  v8::LocalVector<v8::Value> values(js.v8Isolate);
+  values.reserve(columnCount);
+
+  // Populate the array with all column values
+  for (int i = 0; i < columnCount; i++) {
+    KJ_IF_SOME(sqlValue, db.rowOldValue(i)) {
+      KJ_IF_SOME(value, sqlValue) {
+        KJ_SWITCH_ONEOF(value) {
+          KJ_CASE_ONEOF(bytes, kj::Array<kj::byte>) {
+            values.push_back(js.wrapBytes(kj::mv(bytes)));
+          }
+          KJ_CASE_ONEOF(text, kj::StringPtr) {
+            values.push_back(js.str(text));
+          }
+          KJ_CASE_ONEOF(number, double) {
+            values.push_back(js.num(number));
+          }
+        }
+      } else {
+        values.push_back(js.null());
+      }
+    } else {
+      values.push_back(js.null());
+    }
+  }
+
+  return jsg::JsArray(v8::Array::New(js.v8Isolate, values.data(), values.size()));
+}
+
 // Maximum total size of all cached statements (measured in size of the SQL code). If cached
 // statements exceed this, we remove the LRU statement(s).
 //
@@ -35,7 +117,6 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
 
   // Check for re-entrancy before proceeding with SQL operations
   if (insideUpdateHook) {
-    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in exec()", js.toString(querySql));
     JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
                    "This prevents potential database corruption due to SQLite re-entrancy issues.");
   }
@@ -85,7 +166,6 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
 SqlStorage::IngestResult SqlStorage::ingest(jsg::Lock& js, kj::String querySql) {
   // Check for re-entrancy before proceeding with SQL operations
   if (insideUpdateHook) {
-    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in ingest()", querySql);
     JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
                    "This prevents potential database corruption due to SQLite re-entrancy issues.");
   }
@@ -101,7 +181,6 @@ SqlStorage::IngestResult SqlStorage::ingest(jsg::Lock& js, kj::String querySql) 
 jsg::Ref<SqlStorage::Statement> SqlStorage::prepare(jsg::Lock& js, jsg::JsString query) {
   // Check for re-entrancy before proceeding with SQL operations
   if (insideUpdateHook) {
-    KJ_LOG(WARNING, "Detected attempt to re-enter SQLite from update hook in prepare()", js.toString(query));
     JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
                    "This prevents potential database corruption due to SQLite re-entrancy issues.");
   }
@@ -124,7 +203,7 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   return pages * getPageSize(db);
 }
 
-void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String)> callback) {
+void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String, jsg::Ref<SqlUpdateHookValues>)> callback) {
   // Check for re-entrancy
   if (insideUpdateHook) {
     JSG_FAIL_REQUIRE(Error, "SQLite operations are not allowed inside update hook callbacks. "
@@ -180,9 +259,12 @@ void SqlStorage::setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::St
           return; // Unknown operation, ignore
       }
 
+      // Create the values object for accessing old/new data
+      auto valuesObj = jsg::alloc<SqlUpdateHookValues>(getDb(js), operation);
+
       // Callback into Javascript
       try {
-        callback(js, rowid, kj::str(tableName), kj::mv(opStr));
+        callback(js, rowid, kj::str(tableName), kj::mv(opStr), kj::mv(valuesObj));
       } catch (jsg::JsExceptionThrown& e) {
         // Just swallow JS exceptions and let the sql operation continue
       } catch (kj::Exception& e) {
