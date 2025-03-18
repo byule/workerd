@@ -56,12 +56,12 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   jsg::Ref<Statement> prepare(jsg::Lock& js, jsg::JsString query);
 
   double getDatabaseSize(jsg::Lock& js);
-  
+
   // Sets a callback function to be called when database updates occur
   // The callback receives: rowid, tableName, operation ("INSERT", "UPDATE", "DELETE"), values object
   // The values object has lazy-loaded properties 'new' and 'old' that return arrays of column values
   void setUpdateHook(jsg::Lock& js, jsg::Function<void(int64_t, kj::String, kj::String, jsg::Ref<SqlUpdateHookValues>)> callback);
-  
+
   // Clears the update hook callback
   void clearUpdateHook(jsg::Lock& js);
 
@@ -75,7 +75,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
       // 'ingest' functionality is still experimental-only
       JSG_METHOD(ingest);
-      
+
       // Update hook API is experimental-only
       JSG_METHOD(setUpdateHook);
       JSG_METHOD(clearUpdateHook);
@@ -114,13 +114,13 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   kj::Maybe<uint> pageSize;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaPageCount;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaGetMaxPageCount;
-  
+
   // JavaScript callback for update hooks
   kj::Maybe<jsg::Function<void(int64_t, kj::String, kj::String, jsg::Ref<SqlUpdateHookValues>)>> updateHookCallback;
-  
+
   // Flag to track if we're currently executing inside an update hook callback
   // Used to prevent re-entrancy into SQLite from the callback
-  static thread_local bool insideUpdateHook;
+  static bool insideUpdateHook;
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {

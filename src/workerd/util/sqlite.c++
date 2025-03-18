@@ -174,9 +174,6 @@ class SqliteCallScope {
     /* SQLITE_MISUSE doesn't put error info on the database object, so check it separately */      \
     KJ_ASSERT(_ec != SQLITE_MISUSE, "SQLite misused: " #code, ##__VA_ARGS__);                      \
     if (_ec == SQLITE_IOERR) sqliteCallScope.rethrowVfsError();                                    \
-    if (_ec == SQLITE_LOCKED) {                                                                    \
-      /* SQLITE_LOCKED errors are handled by the SQLITE_REQUIRE below */                           \
-    }                                                                                              \
     SQLITE_REQUIRE(_ec == SQLITE_OK, _ec, dbErrorMessage(_ec, db), ##__VA_ARGS__);                 \
   } while (false)
 
@@ -186,9 +183,6 @@ class SqliteCallScope {
   do {                                                                                             \
     KJ_ASSERT(error != SQLITE_MISUSE, "SQLite misused: " code, ##__VA_ARGS__);                     \
     if (error == SQLITE_IOERR) sqliteCallScope.rethrowVfsError();                                  \
-    if (error == SQLITE_LOCKED) {                                                                  \
-      /* SQLITE_LOCKED errors are handled by the SQLITE_REQUIRE below */                           \
-    }                                                                                              \
     SQLITE_REQUIRE(error == SQLITE_OK, error, dbErrorMessage(error, db), ##__VA_ARGS__);           \
   } while (false);
 
