@@ -13,11 +13,9 @@
 
 namespace workerd::api {
 
-// Helper functions for SQLite <-> JavaScript value conversion
-v8::Local<v8::Value> convertSqliteValueToJs(
-    v8::Isolate* isolate, const SqliteDatabase::SqliteValue& sqlValue);
-void convertJsValueToSqlite(
-    v8::Isolate* isolate, v8::Local<v8::Value> value, SqliteDatabase::SqliteContext& context);
+// These helper functions are no longer needed, as we now use
+// SqlStorage::wrapSqlValue to convert SQL values to JS and a direct
+// conversion approach for JS to SQL conversion in UDF callbacks
 
 class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  public:
@@ -207,20 +205,7 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   // Method to ensure built-in functions are initialized
   void ensureBuiltInFunctionsInitialized(jsg::Lock& js);
 
-  // Structure to store serialized JavaScript error information
-  struct SerializedJsError {
-    kj::Array<kj::byte> serializedError;
-    kj::String functionName;
-    kj::String stackTrace;  // Store the original stack trace
-
-    SerializedJsError(kj::Array<kj::byte> data, kj::String name, kj::String stack)
-        : serializedError(kj::mv(data)),
-          functionName(kj::mv(name)),
-          stackTrace(kj::mv(stack)) {}
-  };
-
-  // Thread-local storage for the current JavaScript exception during UDF execution
-  static thread_local kj::Maybe<SerializedJsError> currentJsError;
+  // We no longer need to serialize and store JavaScript errors since we throw them directly
 
   // Utility functions to convert SqlValue to a JS value. We can't just return the C++ values and
   // let JSG do the work because we're trying to avoid having to make a copy of string contents out

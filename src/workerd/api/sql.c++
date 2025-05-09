@@ -12,8 +12,7 @@
 
 namespace workerd::api {
 
-// Initialize the thread-local error storage
-thread_local kj::Maybe<SqlStorage::SerializedJsError> SqlStorage::currentJsError;
+// We no longer need thread-local error storage since we throw exceptions directly
 
 // Maximum total size of all cached statements (measured in size of the SQL code). If cached
 // statements exceed this, we remove the LRU statement(s).
@@ -308,8 +307,7 @@ void SqlStorage::unregisterFunction(jsg::Lock& js, jsg::JsString name) {
   // Remove function from our map
   jsFunctions.erase(nameStr);
 
-  // Clear any stored serialized error
-  SqlStorage::currentJsError = kj::none;
+  // No more error state to clear since we're throwing exceptions directly
 }
 
 double SqlStorage::getDatabaseSize(jsg::Lock& js) {
@@ -341,148 +339,14 @@ bool SqlStorage::isUserDefinedFunction(kj::StringPtr name) const {
   return false;
 }
 
-// Called by SQLite when an error occurs during SQL execution. This method checks if the error
-// originated from a JavaScript UDF and, if so, reconstructs the original JavaScript error
-// with its stack trace and throws it back to JavaScript code. This preserves the full context
-// of where the error occurred in the user's JavaScript code.
+// Called by SQLite when an error occurs during SQL execution. This method directly throws
+// a JavaScript exception with the SQLite error message.
 //
-// Thread safety: This method uses a thread-local variable (SqlStorage::currentJsError) to pass
-// error information from the UDF execution context to this error handler. This approach is
-// safe as long as UDF execution and error handling occur on the same thread, which is
-// guaranteed by SQLite's execution model for the current implementation.
+// Since we now throw exceptions directly from UDF callbacks rather than capturing them in
+// a thread-local variable, this method is much simpler than before.
 void SqlStorage::onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
-  // Error handler called
-
-  // Check if we have a stored serialized JavaScript error from a UDF
-  KJ_IF_SOME(serializedError, SqlStorage::currentJsError) {
-    // Found serialized JS error
-
-    // Get the current JavaScript context
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    jsg::Lock& js = jsg::Lock::from(isolate);
-    v8::HandleScope handleScope(isolate);
-
-    try {
-      // Get the function name
-      kj::StringPtr udfName = serializedError.functionName;
-
-      // Create a descriptive error message that includes both the UDF name
-      // and the SQLite error message for better context
-      kj::String errorMsg = kj::str("JavaScript error in UDF ", udfName, ": ", message);
-
-      // Create a new Error object with our message
-      v8::Local<v8::String> errorMsgV8 = v8::String::NewFromUtf8(
-          isolate, errorMsg.cStr(), v8::NewStringType::kNormal, errorMsg.size())
-                                             .ToLocalChecked();
-
-      v8::Local<v8::Value> newError = v8::Exception::Error(errorMsgV8);
-
-      // Make sure it's an object
-      if (newError->IsObject()) {
-        v8::Local<v8::Object> errorObj = newError.As<v8::Object>();
-        v8::Local<v8::Context> v8Context = isolate->GetCurrentContext();
-
-        // Set the stack trace from the original error to preserve the call location
-        // But add a synthetic frame for the SQL execution context
-
-        // Create an enhanced stack trace that includes the SQL context
-        kj::StringPtr origStack = serializedError.stackTrace;
-
-        // We need to insert our synthetic frame at the point where the UDF execution
-        // transitions to the SQL execution context.
-        //
-        // Use a simpler approach that doesn't require complex string manipulation.
-        // We'll consider a few heuristics to find a good place to insert our frame.
-
-        kj::String enhancedStack;
-
-        // Get the function name that was called
-        kj::StringPtr funcName = serializedError.functionName;
-
-        // We'll insert our frame at a position based on the UDF name
-        const char* stackStr = origStack.cStr();
-
-        // Find an occurrence of the UDF name in the stack trace
-        const char* funcNamePos = strstr(stackStr, funcName.cStr());
-
-        if (funcNamePos == nullptr) {
-          // UDF name not found in stack - look for common execution patterns
-          const char* executePos = strstr(stackStr, "exec");
-          if (executePos != nullptr) {
-            funcNamePos = executePos;
-          } else {
-            // Look for "at" which prefixes stack frames
-            const char* atPos = strstr(stackStr, "at ");
-            if (atPos != nullptr) {
-              funcNamePos = atPos;
-            }
-          }
-        }
-
-        if (funcNamePos == nullptr) {
-          // Still not found - just append our frame at the end
-          enhancedStack =
-              kj::str(origStack, "\n    at SQLite.exec [SQL UDF invocation] (sql.c++:internal)");
-        } else {
-          // Let's try to find an appropriate stack frame boundary near our UDF name
-
-          // First, find the line where the UDF name appears
-          // Look for a newline before this position
-          const char* lineStart = funcNamePos;
-          while (lineStart > stackStr && *(lineStart - 1) != '\n') {
-            lineStart--;
-          }
-
-          // Now find the end of this line
-          const char* lineEnd = strchr(funcNamePos, '\n');
-          if (lineEnd == nullptr) {
-            lineEnd = stackStr + origStack.size();
-          }
-
-          // Find the next line after this one
-          const char* nextLine = lineEnd;
-          if (*nextLine == '\n') {
-            nextLine++;
-          }
-
-          // Calculate our insertion point - put our frame after the function containing the UDF name
-          size_t insertPos = nextLine - stackStr;
-
-          // Construct the enhanced stack trace
-          auto prefix = origStack.slice(0, insertPos);
-          auto suffix = origStack.slice(insertPos);
-
-          enhancedStack = kj::str(
-              prefix, "    at SQLite.exec [SQL UDF invocation] (sql.c++:internal)\n", suffix);
-        }
-
-        v8::Local<v8::String> stackKey = v8::String::NewFromUtf8(isolate, "stack").ToLocalChecked();
-        v8::Local<v8::String> stackValue = v8::String::NewFromUtf8(
-            isolate, enhancedStack.cStr(), v8::NewStringType::kNormal, enhancedStack.size())
-                                               .ToLocalChecked();
-
-        // Set the stack property on the new error
-        errorObj->Set(v8Context, stackKey, stackValue).Check();
-      }
-
-      // Clear the stored error to prevent memory leaks and ensure
-      // the error doesn't accidentally get used for a future unrelated error
-      SqlStorage::currentJsError = kj::none;
-
-      // Throw the new error with the original stack trace
-      js.v8Isolate->ThrowException(newError);
-      throw jsg::JsExceptionThrown();
-    } catch (jsg::JsExceptionThrown&) {
-      // If the exception was already thrown, just let it propagate
-      throw;
-    } catch (...) {
-      // If error creation fails, fall back to a basic error
-      JSG_ASSERT(false, Error, message);
-    }
-  } else {
-    // Regular SQLite error with no JavaScript context
-    JSG_ASSERT(false, Error, message);
-  }
+  // Just throw a basic error with the SQLite error message
+  JSG_ASSERT(false, Error, message);
 }
 
 bool SqlStorage::allowTransactions() const {
