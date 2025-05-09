@@ -907,9 +907,7 @@ bool SqliteDatabase::unregisterFunction(const Regulator& regulator, kj::StringPt
 
 // Structure to hold a kj::Function callback
 struct FunctionCallbackData {
-  kj::Function<void(workerd::SqliteDatabase::SqliteContext&,
-      kj::ArrayPtr<const workerd::SqliteDatabase::SqliteValue>)>
-      callback;
+  workerd::SqliteDatabase::SqlFunctionCallback callback;
 };
 
 // Bridge to call the kj::Function from SQLite
@@ -920,17 +918,74 @@ static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sql
     return;
   }
 
-  // Create a wrapper for the SQLite context
-  workerd::SqliteDatabase::SqliteContext sqlContext(context);
+  // Convert sqlite3_value** to array of KJ value types
+  auto udfArgs = kj::heapArray<workerd::SqliteDatabase::ValuePtr>(argc);
 
-  // Convert arguments to SqliteValue array
-  auto args = kj::heapArray<workerd::SqliteDatabase::SqliteValue>(argc);
   for (int i = 0; i < argc; i++) {
-    args[i] = workerd::SqliteDatabase::SqliteValue(argv[i]);
+    sqlite3_value* sqliteValue = argv[i];
+
+    // Convert based on the SQLite type
+    int valueType = sqlite3_value_type(sqliteValue);
+
+    switch (valueType) {
+      case SQLITE_INTEGER:
+        udfArgs[i] = sqlite3_value_int64(sqliteValue);
+        break;
+
+      case SQLITE_FLOAT:
+        udfArgs[i] = sqlite3_value_double(sqliteValue);
+        break;
+
+      case SQLITE_TEXT: {
+        const char* text = reinterpret_cast<const char*>(sqlite3_value_text(sqliteValue));
+        int length = sqlite3_value_bytes(sqliteValue);
+        udfArgs[i] = kj::StringPtr(text, length);
+        break;
+      }
+
+      case SQLITE_BLOB: {
+        const void* blob = sqlite3_value_blob(sqliteValue);
+        int size = sqlite3_value_bytes(sqliteValue);
+        udfArgs[i] = kj::ArrayPtr<const byte>(static_cast<const byte*>(blob), size);
+        break;
+      }
+
+      case SQLITE_NULL:
+      default:
+        udfArgs[i] = nullptr;
+        break;
+    }
   }
 
-  // Call the function
-  data->callback(sqlContext, args.asPtr());
+  try {
+    // Call the callback with the UDF arguments and get the result
+    auto result = data->callback(udfArgs);
+
+    // Set the result based on the returned value
+    KJ_SWITCH_ONEOF(result) {
+      KJ_CASE_ONEOF(intValue, int64_t) {
+        sqlite3_result_int64(context, intValue);
+      }
+      KJ_CASE_ONEOF(doubleValue, double) {
+        sqlite3_result_double(context, doubleValue);
+      }
+      KJ_CASE_ONEOF(text, kj::StringPtr) {
+        sqlite3_result_text(context, text.cStr(), text.size(), SQLITE_TRANSIENT);
+      }
+      KJ_CASE_ONEOF(blob, kj::ArrayPtr<const byte>) {
+        sqlite3_result_blob(context, blob.begin(), blob.size(), SQLITE_TRANSIENT);
+      }
+      KJ_CASE_ONEOF(nullValue, decltype(nullptr)) {
+        sqlite3_result_null(context);
+      }
+    }
+  } catch (kj::Exception& e) {
+    // Report KJ exceptions as SQLite errors
+    sqlite3_result_error(context, e.getDescription().cStr(), -1);
+  } catch (...) {
+    // Report other exceptions
+    sqlite3_result_error(context, "Unknown error in SQL function", -1);
+  }
 }
 
 // Destructor for FunctionCallbackData
@@ -2611,8 +2666,6 @@ kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
 
 // =======================================================================================
 
-// Implementation of SqliteValue and SqliteContext class methods
-
 // Implementation of SqliteValue class methods
 SqliteDatabase::SqliteValue::SqliteValue(sqlite3_value* value): value(value) {}
 
@@ -2656,37 +2709,6 @@ kj::ArrayPtr<const byte> SqliteDatabase::SqliteValue::getBlob() const {
 
 bool SqliteDatabase::SqliteValue::isNull() const {
   return sqlite3_value_type(value) == SQLITE_NULL;
-}
-
-// Implementation of SqliteContext class methods
-SqliteDatabase::SqliteContext::SqliteContext(sqlite3_context* context): context(context) {}
-
-void SqliteDatabase::SqliteContext::resultInt(int value) {
-  sqlite3_result_int(context, value);
-}
-
-void SqliteDatabase::SqliteContext::resultInt64(int64_t value) {
-  sqlite3_result_int64(context, value);
-}
-
-void SqliteDatabase::SqliteContext::resultDouble(double value) {
-  sqlite3_result_double(context, value);
-}
-
-void SqliteDatabase::SqliteContext::resultText(kj::StringPtr value) {
-  sqlite3_result_text(context, value.cStr(), value.size(), SQLITE_TRANSIENT);
-}
-
-void SqliteDatabase::SqliteContext::resultBlob(kj::ArrayPtr<const byte> value) {
-  sqlite3_result_blob(context, value.begin(), value.size(), SQLITE_TRANSIENT);
-}
-
-void SqliteDatabase::SqliteContext::resultNull() {
-  sqlite3_result_null(context);
-}
-
-void SqliteDatabase::SqliteContext::resultError(kj::StringPtr message) {
-  sqlite3_result_error(context, message.cStr(), message.size());
 }
 
 }  // namespace workerd

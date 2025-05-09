@@ -298,8 +298,14 @@ class SqliteDatabase {
     sqlite3_context* context;
   };
 
+  // Basic value type for representing SQLite values as native types
+  using ValuePtr =
+      kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
+
   // A more modern approach using kj::Function for callback
-  using SqlFunctionCallback = kj::Function<void(SqliteContext&, kj::ArrayPtr<const SqliteValue>)>;
+  // This callback receives an array of values that could be blobs, strings, integers, or floats
+  // It returns a value to set as the function result
+  using SqlFunctionCallback = kj::Function<ValuePtr(kj::ArrayPtr<const ValuePtr>)>;
 
   // Register a custom function with SQLite using modern kj::Function callback approach
   bool registerFunctionCallback(
@@ -542,9 +548,6 @@ class SqliteDatabase::Statement final: private ResetListener {
 // the stack.
 class SqliteDatabase::Query final: private ResetListener {
  public:
-  using ValuePtr =
-      kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
-
   // Construct using Statement::run() or SqliteDatabase::run().
 
   ~Query() noexcept(false);
