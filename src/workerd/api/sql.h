@@ -8,12 +8,25 @@
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/io-context.h>
 #include <workerd/jsg/jsg.h>
+#include <workerd/jsg/ser.h>
 #include <workerd/util/sqlite.h>
 
 namespace workerd::api {
 
+// Helper functions for SQLite <-> JavaScript value conversion
+v8::Local<v8::Value> convertSqliteValueToJs(
+    v8::Isolate* isolate, const SqliteDatabase::SqliteValue& sqlValue);
+void convertJsValueToSqlite(
+    v8::Isolate* isolate, v8::Local<v8::Value> value, SqliteDatabase::SqliteContext& context);
+
 class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  public:
+  // Maximum number of UDFs that can be registered
+  static constexpr uint MAX_UDF_COUNT = 128;
+
+  // Maximum allowed length for UDF names - SQLite limit is 255 utf-8 bytes, excluding null terminator
+  static constexpr uint MAX_UDF_NAME_LENGTH = 255;
+
   SqlStorage(jsg::Ref<DurableObjectStorage> storage);
   ~SqlStorage();
 
@@ -37,6 +50,12 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   double getDatabaseSize(jsg::Lock& js);
 
+  // Create a scalar function for use in SQL queries
+  void createScalarFunction(jsg::Lock& js, jsg::JsString name, jsg::JsValue function);
+
+  // Remove a previously registered scalar function
+  void unregisterFunction(jsg::Lock& js, jsg::JsString name);
+
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
 
@@ -49,6 +68,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       JSG_METHOD(ingest);
 
       JSG_METHOD(setMaxPageCountForTest);
+
+      // JavaScript UDF functionality is experimental-only
+      JSG_METHOD(createScalarFunction);
+      JSG_METHOD(unregisterFunction);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -66,10 +89,16 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  private:
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(storage);
+
+    // Visit all registered JavaScript functions
+    for (auto& entry: jsFunctions) {
+      visitor.visit(entry.value.function);
+    }
   }
 
   bool isAllowedName(kj::StringPtr name) const override;
   bool isAllowedTrigger(kj::StringPtr name) const override;
+  bool isUserDefinedFunction(kj::StringPtr name) const override;
   void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const override;
   bool allowTransactions() const override;
   bool shouldAddQueryStats() const override;
@@ -162,6 +191,36 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       return pageSize.emplace(db.run("PRAGMA page_size;").getInt64(0));
     }
   }
+
+ private:
+  // Simple structure to store JavaScript functions registered for SQL UDFs
+  struct JsFunction {
+    jsg::JsRef<jsg::JsValue> function;
+  };
+
+  // Map of registered JavaScript functions
+  kj::HashMap<kj::String, JsFunction> jsFunctions;
+
+  // Cache of built-in function names from SQLite
+  kj::HashSet<kj::String> builtInFunctions;
+
+  // Method to ensure built-in functions are initialized
+  void ensureBuiltInFunctionsInitialized(jsg::Lock& js);
+
+  // Structure to store serialized JavaScript error information
+  struct SerializedJsError {
+    kj::Array<kj::byte> serializedError;
+    kj::String functionName;
+    kj::String stackTrace;  // Store the original stack trace
+
+    SerializedJsError(kj::Array<kj::byte> data, kj::String name, kj::String stack)
+        : serializedError(kj::mv(data)),
+          functionName(kj::mv(name)),
+          stackTrace(kj::mv(stack)) {}
+  };
+
+  // Thread-local storage for the current JavaScript exception during UDF execution
+  static thread_local kj::Maybe<SerializedJsError> currentJsError;
 
   // Utility functions to convert SqlValue to a JS value. We can't just return the C++ values and
   // let JSG do the work because we're trying to avoid having to make a copy of string contents out

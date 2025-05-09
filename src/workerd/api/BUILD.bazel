@@ -425,6 +425,13 @@ wd_test(
 )
 
 wd_test(
+    size = "large",
+    src = "sql-udf-test.wd-test",
+    args = ["--experimental"],
+    data = ["sql-udf-test.js"],
+)
+
+wd_test(
     src = "streams/identitytransformstream-backpressure-test.wd-test",
     args = ["--experimental"],
     data = ["streams/identitytransformstream-backpressure-test.js"],

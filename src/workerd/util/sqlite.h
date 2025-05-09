@@ -15,6 +15,8 @@
 struct sqlite3;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
+struct sqlite3_context;
+struct sqlite3_value;
 
 KJ_DECLARE_NON_POLYMORPHIC(sqlite3_stmt);
 
@@ -115,6 +117,13 @@ class SqliteDatabase {
     //   created, but how do we track that? In practice we probably never expect triggers to run on
     //   trusted queries.
     virtual bool isAllowedTrigger(kj::StringPtr name) const {
+      return false;
+    }
+
+    // Returns whether the given function name is a user-defined function that should be allowed
+    // to run. This is used to authorize functions that have been registered through the UDF API
+    // but are not part of the standard allowed SQLite functions.
+    virtual bool isUserDefinedFunction(kj::StringPtr name) const {
       return false;
     }
 
@@ -228,6 +237,76 @@ class SqliteDatabase {
 
   // Execute a function with the given regulator.
   void executeWithRegulator(const Regulator& regulator, kj::FunctionParam<void()> func);
+
+  // SQLite function callback type
+  using SqliteCallback = void (*)(sqlite3_context*, int, sqlite3_value**);
+
+  // SQLite destructor callback type
+  using SqliteDestructor = void (*)(void*);
+
+  // Value types that can be stored in SQLite
+  enum class SqliteValueType {
+    NULL_VALUE,  // Using NULL_VALUE to avoid clash with C++ NULL
+    INTEGER,
+    FLOAT,
+    TEXT,
+    BLOB
+  };
+
+  // For better abstraction, we define a wrapper for SQLite value
+  class SqliteValue {
+   public:
+    // Get the value type
+    SqliteValueType getType() const;
+
+    // Get the value as various types
+    int getInt() const;
+    int64_t getInt64() const;
+    double getDouble() const;
+    kj::StringPtr getText() const;
+    kj::ArrayPtr<const byte> getBlob() const;
+    bool isNull() const;
+
+    // Constructor made public for use in the abstract function callback
+    explicit SqliteValue(sqlite3_value* value);
+
+    // Default constructor needed for kj::heapArray
+    SqliteValue(): value(nullptr) {}
+
+   private:
+    friend class SqliteDatabase;
+    sqlite3_value* value;
+  };
+
+  // For better abstraction, we define a wrapper for SQLite context
+  class SqliteContext {
+   public:
+    // Set result as various types
+    void resultInt(int value);
+    void resultInt64(int64_t value);
+    void resultDouble(double value);
+    void resultText(kj::StringPtr value);
+    void resultBlob(kj::ArrayPtr<const byte> value);
+    void resultNull();
+    void resultError(kj::StringPtr message);
+
+    // Constructor made public for use in the abstract function callback
+    explicit SqliteContext(sqlite3_context* context);
+
+   private:
+    friend class SqliteDatabase;
+    sqlite3_context* context;
+  };
+
+  // A more modern approach using kj::Function for callback
+  using SqlFunctionCallback = kj::Function<void(SqliteContext&, kj::ArrayPtr<const SqliteValue>)>;
+
+  // Register a custom function with SQLite using modern kj::Function callback approach
+  bool registerFunctionCallback(
+      const Regulator& regulator, kj::StringPtr name, SqlFunctionCallback callback);
+
+  // Unregister a custom function
+  bool unregisterFunction(const Regulator& regulator, kj::StringPtr name, int argc = -1);
 
   // Resets the database to an empty state by deleting the underlying database file and creating
   // a new one in its place. This is the recommended way to "drop database" in SQLite, and is used

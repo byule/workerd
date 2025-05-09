@@ -8,6 +8,7 @@ import { DurableObject } from 'cloudflare:workers';
 async function test(state) {
   const storage = state.storage;
   const sql = storage.sql;
+
   // Test numeric results
   const resultNumber = [...sql.exec('SELECT 123')];
   assert.equal(resultNumber.length, 1);
