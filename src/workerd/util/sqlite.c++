@@ -929,7 +929,7 @@ static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sql
 
     switch (valueType) {
       case SQLITE_INTEGER:
-        udfArgs[i] = sqlite3_value_int64(sqliteValue);
+        udfArgs[i] = static_cast<int64_t>(sqlite3_value_int64(sqliteValue));
         break;
 
       case SQLITE_FLOAT:
@@ -1683,7 +1683,7 @@ uint SqliteDatabase::Query::columnCount() {
   return sqlite3_column_count(statement);
 }
 
-SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
+SqliteDatabase::ValuePtr SqliteDatabase::Query::getValue(uint column) {
   sqlite3_stmt* statement = getStatement();
   switch (sqlite3_column_type(statement, column)) {
     case SQLITE_INTEGER:
@@ -2666,49 +2666,7 @@ kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
 
 // =======================================================================================
 
-// Implementation of SqliteValue class methods
-SqliteDatabase::SqliteValue::SqliteValue(sqlite3_value* value): value(value) {}
-
-SqliteDatabase::SqliteValueType SqliteDatabase::SqliteValue::getType() const {
-  int type = sqlite3_value_type(value);
-  switch (type) {
-    case SQLITE_INTEGER:
-      return SqliteValueType::INTEGER;
-    case SQLITE_FLOAT:
-      return SqliteValueType::FLOAT;
-    case SQLITE_TEXT:
-      return SqliteValueType::TEXT;
-    case SQLITE_BLOB:
-      return SqliteValueType::BLOB;
-    case SQLITE_NULL:
-    default:
-      return SqliteValueType::NULL_VALUE;
-  }
-}
-
-int SqliteDatabase::SqliteValue::getInt() const {
-  return sqlite3_value_int(value);
-}
-
-int64_t SqliteDatabase::SqliteValue::getInt64() const {
-  return sqlite3_value_int64(value);
-}
-
-double SqliteDatabase::SqliteValue::getDouble() const {
-  return sqlite3_value_double(value);
-}
-
-kj::StringPtr SqliteDatabase::SqliteValue::getText() const {
-  return reinterpret_cast<const char*>(sqlite3_value_text(value));
-}
-
-kj::ArrayPtr<const byte> SqliteDatabase::SqliteValue::getBlob() const {
-  return kj::ArrayPtr<const byte>(
-      static_cast<const byte*>(sqlite3_value_blob(value)), sqlite3_value_bytes(value));
-}
-
-bool SqliteDatabase::SqliteValue::isNull() const {
-  return sqlite3_value_type(value) == SQLITE_NULL;
-}
+// SqliteValue class has been removed. Logic for handling SQLite values is now
+// performed directly in the UDF callback using KJ types.
 
 }  // namespace workerd
