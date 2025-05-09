@@ -161,96 +161,8 @@ void SqlStorage::createScalarFunction(
   // Get the database
   auto& db = getDb(js);
 
-  // Create a callback function that will be called when the SQL function is executed
-  // Helper function to capture JavaScript errors from UDFs with stack traces
-  // This function extracts error information from a V8 TryCatch object, including the stack trace,
-  // serializes the error, and prepares it for later use when propagating through the SQLite error
-  // handling system. It also sets an appropriate error message in the SQLite context.
-  //
-  // Parameters:
-  //   jsLock - The current JavaScript lock
-  //   isolate - The V8 isolate
-  //   tryCatch - The V8 TryCatch object containing the caught exception
-  //   funcName - The name of the UDF function where the error occurred
-  //   context - The SQLite context to report the error to
-  //
-  // Returns:
-  //   SerializedJsError containing the serialized error and stack trace information
-  auto captureJsError = [](jsg::Lock& jsLock, v8::Isolate* isolate, v8::TryCatch& tryCatch,
-                            kj::StringPtr funcName,
-                            SqliteDatabase::SqliteContext& context) -> SerializedJsError {
-    // Get the exception from the tryCatch
-    v8::Local<v8::Value> exception = tryCatch.Exception();
-
-    // Create a serializer for the error
-    jsg::Serializer serializer(jsLock);
-
-    // If we have a valid exception, use it, otherwise create a generic one
-    v8::Local<v8::Value> errorValue;
-    kj::String stackTrace;
-
-    if (!exception.IsEmpty() && exception->IsObject()) {
-      errorValue = exception;
-
-      // Extract stack trace if available
-      v8::Local<v8::Context> v8Context = isolate->GetCurrentContext();
-      v8::Local<v8::Object> exceptionObj = exception.As<v8::Object>();
-
-      // Try to get the stack property
-      v8::Local<v8::String> stackKey = v8::String::NewFromUtf8(isolate, "stack").ToLocalChecked();
-      v8::MaybeLocal<v8::Value> maybeStack = exceptionObj->Get(v8Context, stackKey);
-
-      if (!maybeStack.IsEmpty()) {
-        v8::Local<v8::Value> stackValue = maybeStack.ToLocalChecked();
-        if (stackValue->IsString()) {
-          v8::String::Utf8Value stackStr(isolate, stackValue);
-          if (*stackStr) {
-            // Store the stack trace
-            stackTrace = kj::heapString(*stackStr, stackStr.length());
-          } else {
-            stackTrace = kj::str("Error in UDF function: ", funcName, " (stack unavailable)");
-          }
-        } else {
-          stackTrace = kj::str("Error in UDF function: ", funcName, " (stack not a string)");
-        }
-      } else {
-        stackTrace = kj::str("Error in UDF function: ", funcName, " (no stack property)");
-      }
-
-      // Try to get a message for the SQLite error
-      kj::String sqliteErrorMsg = kj::str("JavaScript error in UDF ", funcName);
-      v8::Local<v8::String> msgKey = v8::String::NewFromUtf8(isolate, "message").ToLocalChecked();
-      v8::MaybeLocal<v8::Value> maybeMsg = exceptionObj->Get(v8Context, msgKey);
-
-      if (!maybeMsg.IsEmpty()) {
-        v8::Local<v8::Value> msgValue = maybeMsg.ToLocalChecked();
-        if (msgValue->IsString()) {
-          v8::String::Utf8Value msgStr(isolate, msgValue);
-          if (*msgStr) {
-            sqliteErrorMsg = kj::str("JavaScript error in UDF ", funcName, ": ", *msgStr);
-          }
-        }
-      }
-
-      // Return the error message to SQLite
-      context.resultError(sqliteErrorMsg);
-    } else {
-      // Create a generic error if we couldn't get the actual error
-      errorValue = v8::Exception::Error(
-          v8::String::NewFromUtf8(isolate, "JavaScript error in UDF function").ToLocalChecked());
-      stackTrace = kj::str("Error in UDF function: ", funcName, " (exception details unavailable)");
-
-      // Return a generic error to SQLite
-      context.resultError(kj::str("JavaScript error in UDF ", funcName, ": <JavaScript error>"));
-    }
-
-    // Serialize the error
-    serializer.write(jsLock, jsg::JsValue(errorValue));
-    auto serializedData = serializer.release();
-
-    // Return the serialized error with stack trace information
-    return SerializedJsError(kj::mv(serializedData.data), kj::str(funcName), kj::mv(stackTrace));
-  };
+  // Since we now directly throw exceptions from the UDF callback,
+  // we no longer need this helper function for capturing errors
 
   auto callback =
       [funcRef = jsg::JsRef<jsg::JsValue>(js, functionValue), isolate = js.v8Isolate,
@@ -276,40 +188,30 @@ void SqlStorage::createScalarFunction(
     auto jsArgs = kj::heapArray<v8::Local<v8::Value>>(udfArgs.size());
 
     for (size_t i = 0; i < udfArgs.size(); i++) {
-      // Convert each KJ value to a JS value
+      // First convert the ValuePtr to SqlValue (similar to what happens in iteratorImpl)
+      SqlValue value;
+
       KJ_SWITCH_ONEOF(udfArgs[i]) {
         KJ_CASE_ONEOF(blobPtr, kj::ArrayPtr<const byte>) {
-          // Convert blob to ArrayBuffer
-          auto arrayBuffer = v8::ArrayBuffer::New(isolate, blobPtr.size());
-          if (blobPtr.size() > 0) {
-            memcpy(arrayBuffer->GetBackingStore()->Data(), blobPtr.begin(), blobPtr.size());
-          }
-          jsArgs[i] = arrayBuffer;
+          value.emplace(kj::heapArray(blobPtr));
         }
         KJ_CASE_ONEOF(text, kj::StringPtr) {
-          // Convert string to JS string
-          jsArgs[i] =
-              v8::String::NewFromUtf8(isolate, text.cStr(), v8::NewStringType::kNormal, text.size())
-                  .ToLocalChecked();
+          value.emplace(text);
         }
         KJ_CASE_ONEOF(intValue, int64_t) {
-          // Convert integer to JS number
-          if (intValue >= std::numeric_limits<int>::min() &&
-              intValue <= std::numeric_limits<int>::max()) {
-            jsArgs[i] = v8::Integer::New(isolate, static_cast<int>(intValue));
-          } else {
-            jsArgs[i] = v8::Number::New(isolate, static_cast<double>(intValue));
-          }
+          // Convert to double like we do in iteratorImpl for consistency
+          value.emplace(static_cast<double>(intValue));
         }
         KJ_CASE_ONEOF(doubleValue, double) {
-          // Convert double to JS number
-          jsArgs[i] = v8::Number::New(isolate, doubleValue);
+          value.emplace(doubleValue);
         }
         KJ_CASE_ONEOF(nullValue, decltype(nullptr)) {
-          // Convert null to JS null
-          jsArgs[i] = v8::Null(isolate);
+          // Leave value as null
         }
       }
+
+      // Then use the existing wrapSqlValue function to convert to JS
+      jsArgs[i] = wrapSqlValue(jsLock, kj::mv(value));
     }
 
     // Call the function
@@ -326,38 +228,41 @@ void SqlStorage::createScalarFunction(
       throw tryCatch.Exception();
     }
 
-    // Convert the JavaScript result to a SqlValue
+    // Get the JavaScript result
     v8::Local<v8::Value> jsResult = maybeResult.ToLocalChecked();
     v8::Local<v8::Context> v8Context2 = isolate->GetCurrentContext();
 
+    // This is similar to jsValueToSqlite but returns ValuePtr instead of setting SQLiteContext
+    SqliteDatabase::ValuePtr result;
+
     // Convert based on the JS type
     if (jsResult->IsNull() || jsResult->IsUndefined()) {
-      return nullptr;
+      result = nullptr;
     } else if (jsResult->IsInt32() || jsResult->IsUint32()) {
-      return static_cast<int64_t>(jsResult->IntegerValue(v8Context2).ToChecked());
+      result = static_cast<int64_t>(jsResult->IntegerValue(v8Context2).ToChecked());
     } else if (jsResult->IsNumber()) {
       double num = jsResult->NumberValue(v8Context2).ToChecked();
       if (num == static_cast<int64_t>(num)) {
-        return static_cast<int64_t>(num);
+        result = static_cast<int64_t>(num);
       } else {
-        return num;
+        result = num;
       }
     } else if (jsResult->IsString()) {
       v8::String::Utf8Value str(isolate, jsResult);
       if (*str) {
         // Return a string - note that we can't return a heap string here as
         // it won't live long enough, so we rely on SQLITE_TRANSIENT in the bridge
-        return kj::StringPtr(*str, str.length());
+        result = kj::StringPtr(*str, str.length());
       } else {
-        return kj::StringPtr("<string conversion failed>");
+        result = kj::StringPtr("<string conversion failed>");
       }
     } else if (jsResult->IsBoolean()) {
-      return static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
+      result = static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
     } else if (jsResult->IsArrayBuffer()) {
       v8::Local<v8::ArrayBuffer> arrayBuffer = v8::Local<v8::ArrayBuffer>::Cast(jsResult);
       auto backingStore = arrayBuffer->GetBackingStore();
       // Similar to strings, we can't return a heap array here
-      return kj::ArrayPtr<const byte>(
+      result = kj::ArrayPtr<const byte>(
           static_cast<const byte*>(backingStore->Data()), backingStore->ByteLength());
     } else {
       // For anything else, convert to string
@@ -365,11 +270,16 @@ void SqlStorage::createScalarFunction(
       if (jsResult->ToString(v8Context2).ToLocal(&strValue)) {
         v8::String::Utf8Value str(isolate, strValue);
         if (*str) {
-          return kj::StringPtr(*str, str.length());
+          result = kj::StringPtr(*str, str.length());
+        } else {
+          result = kj::StringPtr("<string conversion failed>");
         }
+      } else {
+        result = kj::StringPtr("<string conversion failed>");
       }
-      return kj::StringPtr("<string conversion failed>");
     }
+
+    return result;
   };
 
   // Store in our function map for GC tracking

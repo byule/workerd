@@ -238,65 +238,9 @@ class SqliteDatabase {
   // Execute a function with the given regulator.
   void executeWithRegulator(const Regulator& regulator, kj::FunctionParam<void()> func);
 
-  // SQLite function callback type
+  // Basic SQLite C callback and destructor types
   using SqliteCallback = void (*)(sqlite3_context*, int, sqlite3_value**);
-
-  // SQLite destructor callback type
   using SqliteDestructor = void (*)(void*);
-
-  // Value types that can be stored in SQLite
-  enum class SqliteValueType {
-    NULL_VALUE,  // Using NULL_VALUE to avoid clash with C++ NULL
-    INTEGER,
-    FLOAT,
-    TEXT,
-    BLOB
-  };
-
-  // For better abstraction, we define a wrapper for SQLite value
-  class SqliteValue {
-   public:
-    // Get the value type
-    SqliteValueType getType() const;
-
-    // Get the value as various types
-    int getInt() const;
-    int64_t getInt64() const;
-    double getDouble() const;
-    kj::StringPtr getText() const;
-    kj::ArrayPtr<const byte> getBlob() const;
-    bool isNull() const;
-
-    // Constructor made public for use in the abstract function callback
-    explicit SqliteValue(sqlite3_value* value);
-
-    // Default constructor needed for kj::heapArray
-    SqliteValue(): value(nullptr) {}
-
-   private:
-    friend class SqliteDatabase;
-    sqlite3_value* value;
-  };
-
-  // For better abstraction, we define a wrapper for SQLite context
-  class SqliteContext {
-   public:
-    // Set result as various types
-    void resultInt(int value);
-    void resultInt64(int64_t value);
-    void resultDouble(double value);
-    void resultText(kj::StringPtr value);
-    void resultBlob(kj::ArrayPtr<const byte> value);
-    void resultNull();
-    void resultError(kj::StringPtr message);
-
-    // Constructor made public for use in the abstract function callback
-    explicit SqliteContext(sqlite3_context* context);
-
-   private:
-    friend class SqliteDatabase;
-    sqlite3_context* context;
-  };
 
   // Basic value type for representing SQLite values as native types
   using ValuePtr =
