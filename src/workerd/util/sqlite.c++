@@ -972,10 +972,8 @@ static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sql
         sqlite3_result_double(context, doubleValue);
       }
       KJ_CASE_ONEOF(text, kj::String) {
-        // SQLITE_TRANSIENT tells SQLite to make its own copy of the data
-        const char* cstr = text.cStr();
-        int len = text.size();
-        sqlite3_result_text(context, cstr, len, SQLITE_TRANSIENT);
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the string data
+        sqlite3_result_text(context, text.cStr(), text.size(), SQLITE_TRANSIENT);
       }
       KJ_CASE_ONEOF(blob, kj::Array<byte>) {
         // SQLITE_TRANSIENT tells SQLite to make its own copy of the data

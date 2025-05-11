@@ -246,9 +246,7 @@ class SqliteDatabase {
   using ValuePtr =
       kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
 
-  // A more modern approach using kj::Function for callback
-  // This callback receives an array of values that could be blobs, strings, integers, or floats
-  // It returns a value to set as the function result - using owned types to ensure proper lifetime management
+  // Function callback for SQL UDFs, returning owned types to ensure values persist until SQLite is done with them
   using SqlFunctionCallback =
       kj::Function<kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)>(
           kj::ArrayPtr<const ValuePtr>)>;

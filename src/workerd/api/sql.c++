@@ -246,7 +246,7 @@ void SqlStorage::createScalarFunction(
         return num;
       }
     } else if (jsResult->IsString()) {
-      // Return an owned kj::String directly
+      // Convert JS string to owned kj::String for safe lifetime management
       return jsLock.toString(jsResult);
     } else if (jsResult->IsBoolean()) {
       return static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
@@ -254,6 +254,7 @@ void SqlStorage::createScalarFunction(
       v8::Local<v8::ArrayBuffer> arrayBuffer = v8::Local<v8::ArrayBuffer>::Cast(jsResult);
       auto backingStore = arrayBuffer->GetBackingStore();
 
+      // Create an owned copy of the ArrayBuffer data
       auto size = backingStore->ByteLength();
       auto copy = kj::heapArray<byte>(size);
 
