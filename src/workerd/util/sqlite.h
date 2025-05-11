@@ -248,8 +248,10 @@ class SqliteDatabase {
 
   // A more modern approach using kj::Function for callback
   // This callback receives an array of values that could be blobs, strings, integers, or floats
-  // It returns a value to set as the function result
-  using SqlFunctionCallback = kj::Function<ValuePtr(kj::ArrayPtr<const ValuePtr>)>;
+  // It returns a value to set as the function result - using owned types to ensure proper lifetime management
+  using SqlFunctionCallback =
+      kj::Function<kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)>(
+          kj::ArrayPtr<const ValuePtr>)>;
 
   // Register a custom function with SQLite using modern kj::Function callback approach
   bool registerFunctionCallback(

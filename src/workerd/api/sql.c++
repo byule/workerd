@@ -163,10 +163,10 @@ void SqlStorage::createScalarFunction(
   // Since we now directly throw exceptions from the UDF callback,
   // we no longer need this helper function for capturing errors
 
-  auto callback =
-      [funcRef = jsg::JsRef<jsg::JsValue>(js, functionValue), isolate = js.v8Isolate,
-          funcName = kj::str(nameStr)](
-          kj::ArrayPtr<const SqliteDatabase::ValuePtr> udfArgs) -> SqliteDatabase::ValuePtr {
+  auto callback = [funcRef = jsg::JsRef<jsg::JsValue>(js, functionValue), isolate = js.v8Isolate,
+                      funcName = kj::str(nameStr)](
+                      kj::ArrayPtr<const SqliteDatabase::ValuePtr> udfArgs)
+      -> kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)> {
     // Get the current JavaScript context
     jsg::Lock& jsLock = jsg::Lock::from(isolate);
     v8::HandleScope handleScope(isolate);
@@ -192,9 +192,11 @@ void SqlStorage::createScalarFunction(
 
       KJ_SWITCH_ONEOF(udfArgs[i]) {
         KJ_CASE_ONEOF(blobPtr, kj::ArrayPtr<const byte>) {
+          // Clone the blob data into a new array - this may be necessary for longevity
           value.emplace(kj::heapArray(blobPtr));
         }
         KJ_CASE_ONEOF(text, kj::StringPtr) {
+          // StringPtr is valid during the callback and immediately converted to JS
           value.emplace(text);
         }
         KJ_CASE_ONEOF(intValue, int64_t) {
@@ -231,54 +233,55 @@ void SqlStorage::createScalarFunction(
     v8::Local<v8::Value> jsResult = maybeResult.ToLocalChecked();
     v8::Local<v8::Context> v8Context2 = isolate->GetCurrentContext();
 
-    // This is similar to jsValueToSqlite but returns ValuePtr instead of setting SQLiteContext
-    SqliteDatabase::ValuePtr result;
-
     // Convert based on the JS type
     if (jsResult->IsNull() || jsResult->IsUndefined()) {
-      result = nullptr;
+      return nullptr;
     } else if (jsResult->IsInt32() || jsResult->IsUint32()) {
-      result = static_cast<int64_t>(jsResult->IntegerValue(v8Context2).ToChecked());
+      return static_cast<int64_t>(jsResult->IntegerValue(v8Context2).ToChecked());
     } else if (jsResult->IsNumber()) {
       double num = jsResult->NumberValue(v8Context2).ToChecked();
       if (num == static_cast<int64_t>(num)) {
-        result = static_cast<int64_t>(num);
+        return static_cast<int64_t>(num);
       } else {
-        result = num;
+        return num;
       }
     } else if (jsResult->IsString()) {
-      v8::String::Utf8Value str(isolate, jsResult);
-      if (*str) {
-        // Return a string - note that we can't return a heap string here as
-        // it won't live long enough, so we rely on SQLITE_TRANSIENT in the bridge
-        result = kj::StringPtr(*str, str.length());
-      } else {
-        result = kj::StringPtr("<string conversion failed>");
-      }
+      // Return an owned kj::String directly
+      return jsLock.toString(jsResult);
     } else if (jsResult->IsBoolean()) {
-      result = static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
+      return static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
     } else if (jsResult->IsArrayBuffer()) {
       v8::Local<v8::ArrayBuffer> arrayBuffer = v8::Local<v8::ArrayBuffer>::Cast(jsResult);
       auto backingStore = arrayBuffer->GetBackingStore();
-      // Similar to strings, we can't return a heap array here
-      result = kj::ArrayPtr<const byte>(
-          static_cast<const byte*>(backingStore->Data()), backingStore->ByteLength());
-    } else {
-      // For anything else, convert to string
-      v8::Local<v8::String> strValue;
-      if (jsResult->ToString(v8Context2).ToLocal(&strValue)) {
-        v8::String::Utf8Value str(isolate, strValue);
-        if (*str) {
-          result = kj::StringPtr(*str, str.length());
-        } else {
-          result = kj::StringPtr("<string conversion failed>");
-        }
-      } else {
-        result = kj::StringPtr("<string conversion failed>");
-      }
-    }
 
-    return result;
+      auto size = backingStore->ByteLength();
+      auto copy = kj::heapArray<byte>(size);
+
+      if (size > 0) {
+        memcpy(copy.begin(), backingStore->Data(), size);
+      }
+
+      return kj::mv(copy);
+    } else if (jsResult->IsUint8Array() || jsResult->IsInt8Array() ||
+        jsResult->IsUint8ClampedArray()) {
+      v8::Local<v8::TypedArray> typedArray = v8::Local<v8::TypedArray>::Cast(jsResult);
+      auto buffer = typedArray->Buffer();
+      auto backingStore = buffer->GetBackingStore();
+      auto byteOffset = typedArray->ByteOffset();
+      auto byteLength = typedArray->ByteLength();
+
+      auto copy = kj::heapArray<byte>(byteLength);
+
+      if (byteLength > 0) {
+        memcpy(
+            copy.begin(), static_cast<const byte*>(backingStore->Data()) + byteOffset, byteLength);
+      }
+
+      return kj::mv(copy);
+    } else {
+      // TODO: Throw a more specific error
+      return nullptr;
+    }
   };
 
   // Store in our function map for GC tracking
@@ -601,9 +604,9 @@ void SqlStorage::Cursor::endQuery(State& stateRef) {
   state = kj::none;
 }
 
-kj::Array<const SqliteDatabase::Query::ValuePtr> SqlStorage::Cursor::mapBindings(
+kj::Array<const SqliteDatabase::ValuePtr> SqlStorage::Cursor::mapBindings(
     kj::ArrayPtr<BindingValue> values) {
-  return KJ_MAP(value, values) -> SqliteDatabase::Query::ValuePtr {
+  return KJ_MAP(value, values) -> SqliteDatabase::ValuePtr {
     KJ_IF_SOME(v, value) {
       KJ_SWITCH_ONEOF(v) {
         KJ_CASE_ONEOF(data, kj::Array<const byte>) {

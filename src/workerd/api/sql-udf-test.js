@@ -260,7 +260,7 @@ export class DurableObjectExample extends DurableObject {
         `BLOB should be an ArrayBuffer but got ${typeof val}: ${Object.prototype.toString.call(val)}`
       );
 
-      // Return a new Uint8Array - this will be converted to a string in the result
+      // Return a new Uint8Array - should be properly handled as an ArrayBuffer
       return new Uint8Array(val);
     });
 
@@ -269,12 +269,10 @@ export class DurableObjectExample extends DurableObject {
       ...sql.exec('SELECT blobTest(blob_val) as result FROM types_test'),
     ];
 
-    // TODO: BLOB results from UDFs are returned as strings rather than Uint8Array objects,
-    // which is inconsistent with how BLOBs are passed to UDFs
-    assert.strictEqual(
-      typeof result[0].result,
-      'string',
-      'BLOB results from UDFs are converted to strings'
+    // BLOBs returned from UDFs should be ArrayBuffers, consistent with direct query results
+    assert.ok(
+      result[0].result instanceof ArrayBuffer,
+      'BLOB results from UDFs should be returned as ArrayBuffer objects'
     );
 
     // Test direct BLOB query results (not through UDF)

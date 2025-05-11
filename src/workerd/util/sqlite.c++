@@ -937,16 +937,18 @@ static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sql
         break;
 
       case SQLITE_TEXT: {
-        const char* text = reinterpret_cast<const char*>(sqlite3_value_text(sqliteValue));
+        // For text, follow the pattern from Query::getText
+        const char* ptr = reinterpret_cast<const char*>(sqlite3_value_text(sqliteValue));
         int length = sqlite3_value_bytes(sqliteValue);
-        udfArgs[i] = kj::StringPtr(text, length);
+        udfArgs[i] = kj::StringPtr(ptr, length);
         break;
       }
 
       case SQLITE_BLOB: {
-        const void* blob = sqlite3_value_blob(sqliteValue);
+        // For blobs, follow the pattern from Query::getBlob
+        const byte* ptr = reinterpret_cast<const byte*>(sqlite3_value_blob(sqliteValue));
         int size = sqlite3_value_bytes(sqliteValue);
-        udfArgs[i] = kj::ArrayPtr<const byte>(static_cast<const byte*>(blob), size);
+        udfArgs[i] = kj::arrayPtr(ptr, size);
         break;
       }
 
@@ -969,10 +971,14 @@ static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sql
       KJ_CASE_ONEOF(doubleValue, double) {
         sqlite3_result_double(context, doubleValue);
       }
-      KJ_CASE_ONEOF(text, kj::StringPtr) {
-        sqlite3_result_text(context, text.cStr(), text.size(), SQLITE_TRANSIENT);
+      KJ_CASE_ONEOF(text, kj::String) {
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the data
+        const char* cstr = text.cStr();
+        int len = text.size();
+        sqlite3_result_text(context, cstr, len, SQLITE_TRANSIENT);
       }
-      KJ_CASE_ONEOF(blob, kj::ArrayPtr<const byte>) {
+      KJ_CASE_ONEOF(blob, kj::Array<byte>) {
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the data
         sqlite3_result_blob(context, blob.begin(), blob.size(), SQLITE_TRANSIENT);
       }
       KJ_CASE_ONEOF(nullValue, decltype(nullptr)) {

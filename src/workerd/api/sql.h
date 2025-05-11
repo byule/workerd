@@ -332,8 +332,7 @@ class SqlStorage::Cursor final: public jsg::Object {
   // Initialize `columnNames` from the state object.
   void initColumnNames(jsg::Lock& js, State& stateRef);
 
-  static kj::Array<const SqliteDatabase::Query::ValuePtr> mapBindings(
-      kj::ArrayPtr<BindingValue> values);
+  static kj::Array<const SqliteDatabase::ValuePtr> mapBindings(kj::ArrayPtr<BindingValue> values);
 
   static kj::Maybe<jsg::JsObject> rowIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
   static kj::Maybe<jsg::JsArray> rawIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
