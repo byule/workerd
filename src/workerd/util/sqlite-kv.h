@@ -12,7 +12,9 @@ namespace workerd {
 // In this case we just customize the error reporting to emit JSG user visible errors instead
 // of KJ exceptions which become internal errors.
 class SqliteKvRegulator: public SqliteDatabase::Regulator {
-  void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const override;
+  void onError(kj::Maybe<int> sqliteErrorCode,
+      kj::StringPtr message,
+      kj::Maybe<const kj::Exception&> exception = kj::none) const override;
 
   // We bill for KV operations as rows read/written.
   virtual bool shouldAddQueryStats() const override {

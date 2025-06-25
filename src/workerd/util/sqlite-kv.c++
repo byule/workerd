@@ -10,7 +10,10 @@
 
 namespace workerd {
 
-void SqliteKvRegulator::onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
+void SqliteKvRegulator::onError(kj::Maybe<int> sqliteErrorCode,
+    kj::StringPtr message,
+    kj::Maybe<const kj::Exception&> exception) const {
+  // Handle normal SQLite errors - KV storage doesn't use UDFs so no need to handle those errors
   KJ_IF_SOME(ec, sqliteErrorCode) {
     switch (ec) {
       case SQLITE_TOOBIG:
