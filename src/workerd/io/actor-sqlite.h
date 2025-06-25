@@ -100,7 +100,9 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
   // into application errors as appropriate when committing an implicit transaction.
   class TxnCommitRegulator: public SqliteDatabase::Regulator {
    public:
-    void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const;
+    void onError(kj::Maybe<int> sqliteErrorCode,
+        kj::StringPtr message,
+        kj::Maybe<const kj::Exception&> exception = kj::none) const;
   };
   static constexpr TxnCommitRegulator TRUSTED_TXN_COMMIT;
 

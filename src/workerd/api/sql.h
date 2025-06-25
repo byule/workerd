@@ -8,12 +8,23 @@
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/io-context.h>
 #include <workerd/jsg/jsg.h>
+#include <workerd/jsg/ser.h>
 #include <workerd/util/sqlite.h>
 
 namespace workerd::api {
 
+// These helper functions are no longer needed, as we now use
+// SqlStorage::wrapSqlValue to convert SQL values to JS and a direct
+// conversion approach for JS to SQL conversion in UDF callbacks
+
 class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  public:
+  // Maximum number of UDFs that can be registered
+  static constexpr uint MAX_UDF_COUNT = 128;
+
+  // Maximum allowed length for UDF names - SQLite limit is 255 utf-8 bytes, excluding null terminator
+  static constexpr uint MAX_UDF_NAME_LENGTH = 255;
+
   SqlStorage(jsg::Ref<DurableObjectStorage> storage);
   ~SqlStorage();
 
@@ -37,6 +48,12 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   double getDatabaseSize(jsg::Lock& js);
 
+  // Create a scalar function for use in SQL queries
+  void createScalarFunction(jsg::Lock& js, jsg::JsString name, jsg::JsValue function);
+
+  // Remove a previously registered scalar function
+  void unregisterFunction(jsg::Lock& js, jsg::JsString name);
+
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
 
@@ -49,6 +66,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       JSG_METHOD(ingest);
 
       JSG_METHOD(setMaxPageCountForTest);
+
+      // JavaScript UDF functionality is experimental-only
+      JSG_METHOD(createScalarFunction);
+      JSG_METHOD(unregisterFunction);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -66,11 +87,19 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  private:
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(storage);
+
+    // Visit all registered JavaScript functions
+    for (auto& entry: jsFunctions) {
+      visitor.visit(entry.value.function);
+    }
   }
 
   bool isAllowedName(kj::StringPtr name) const override;
   bool isAllowedTrigger(kj::StringPtr name) const override;
-  void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const override;
+  bool isUserDefinedFunction(kj::StringPtr name) const override;
+  void onError(kj::Maybe<int> sqliteErrorCode,
+      kj::StringPtr message,
+      kj::Maybe<const kj::Exception&> exception = kj::none) const override;
   bool allowTransactions() const override;
   bool shouldAddQueryStats() const override;
 
@@ -162,6 +191,26 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       return pageSize.emplace(db.run("PRAGMA page_size;").getInt64(0));
     }
   }
+
+ private:
+  // Simple structure to store JavaScript functions registered for SQL UDFs
+  struct JsFunction {
+    jsg::JsRef<jsg::JsValue> function;
+  };
+
+  // Map of registered JavaScript functions
+  kj::HashMap<kj::String, JsFunction> jsFunctions;
+
+  // Cache of built-in function names from SQLite
+  kj::HashSet<kj::String> builtInFunctions;
+
+  // Method to ensure built-in functions are initialized
+  void ensureBuiltInFunctionsInitialized(jsg::Lock& js);
+
+  // Thread-local storage for JavaScript error details
+  static thread_local kj::String lastErrorMessage;
+  static thread_local kj::String lastErrorStack;
+  static thread_local bool hasJsException;
 
   // Utility functions to convert SqlValue to a JS value. We can't just return the C++ values and
   // let JSG do the work because we're trying to avoid having to make a copy of string contents out
@@ -288,8 +337,7 @@ class SqlStorage::Cursor final: public jsg::Object {
   // Initialize `columnNames` from the state object.
   void initColumnNames(jsg::Lock& js, State& stateRef);
 
-  static kj::Array<const SqliteDatabase::Query::ValuePtr> mapBindings(
-      kj::ArrayPtr<BindingValue> values);
+  static kj::Array<const SqliteDatabase::ValuePtr> mapBindings(kj::ArrayPtr<BindingValue> values);
 
   static kj::Maybe<jsg::JsObject> rowIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
   static kj::Maybe<jsg::JsArray> rawIteratorNext(jsg::Lock& js, jsg::Ref<Cursor>& obj);
