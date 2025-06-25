@@ -736,7 +736,16 @@ kj::Promise<void> ActorSqlite::waitForBookmark(kj::StringPtr bookmark) {
 }
 
 void ActorSqlite::TxnCommitRegulator::onError(
-    kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
+    kj::Maybe<int> sqliteErrorCode, kj::StringPtr message,
+    kj::Maybe<const kj::Exception&> exception) const {
+  // If we have an exception from a UDF, use it directly
+  KJ_IF_SOME(e, exception) {
+    // This is an exception from a UDF, throw it directly
+    JSG_FAIL_REQUIRE(Error, e.getDescription());
+    return;
+  }
+
+  // Otherwise handle normal SQLite errors
   KJ_IF_SOME(c, sqliteErrorCode) {
     if (c == SQLITE_CONSTRAINT) {
       JSG_ASSERT(false, Error,
