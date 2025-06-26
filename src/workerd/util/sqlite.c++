@@ -120,12 +120,28 @@ void reportVfsErrorCaught(kj::Exception&& e) {
 // Implements SQLITE_CALL_SCOPE.
 class SqliteCallScope {
  public:
+  // Thread-local boolean indicating whether we're in a SQLite call
+  static thread_local bool inSqliteCall;
+
+  // Store previous state to properly handle nested calls
+  bool previousState;
+
   SqliteCallScope() {
     KJ_DASSERT(vfsErrorListener == nullptr);
     vfsErrorListener = &error;
+
+    // Save previous state for proper nesting
+    previousState = inSqliteCall;
+
+    // Set the flag to true when entering a scope
+    inSqliteCall = true;
   }
+
   ~SqliteCallScope() {
     vfsErrorListener = nullptr;
+
+    // Restore previous state when exiting scope
+    inSqliteCall = previousState;
   }
 
   void rethrowVfsError() {
@@ -137,6 +153,11 @@ class SqliteCallScope {
       // `throwFatalException()` does after extending the stack.
       kj::getExceptionCallback().onFatalException(kj::mv(e));
     }
+  }
+
+  // Static method to check if we're inside a SQLite call
+  static bool isActive() {
+    return inSqliteCall;
   }
 
   kj::Maybe<const kj::Exception&> getException() {
@@ -158,7 +179,12 @@ class SqliteCallScope {
 // sqliteErrorCode is a kj::Maybe<int> and represents the error code from sqlite.
 #define SQLITE_REQUIRE(condition, sqliteErrorCode, errorMessage, ...)                              \
   if (!(condition)) {                                                                              \
-    regulator.onError(sqliteErrorCode, errorMessage);                                              \
+    /* Get the current exception if it exists */                                                   \
+    kj::Maybe<const kj::Exception&> maybeException = kj::none;                                     \
+    if (vfsErrorListener != nullptr && *vfsErrorListener != kj::none) {                            \
+      maybeException = KJ_ASSERT_NONNULL(*vfsErrorListener);                                       \
+    }                                                                                              \
+    regulator.onError(sqliteErrorCode, errorMessage, maybeException);                              \
     KJ_FAIL_REQUIRE("SQLite failed", errorMessage, ##__VA_ARGS__);                                 \
   }
 
@@ -206,6 +232,16 @@ class SqliteCallScope {
 //   }
 //
 // Note that if you use SQLITE_CALL(), this is handled automatically.
+// Initialize the reentrancy tracking variable
+thread_local bool SqliteCallScope::inSqliteCall = false;
+
+// Public function to check if we're inside a SQLite call
+// This is used by the SQL API to prevent reentrancy
+bool isSqliteCallActive() {
+  // Use the existing SqliteCallScope method to check if we're in a SQLite call
+  return SqliteCallScope::isActive();
+}
+
 #define SQLITE_CALL_SCOPE                                                                          \
   for (SqliteCallScope sqliteCallScope; !sqliteCallScope.done; sqliteCallScope.done = true)
 
@@ -853,6 +889,155 @@ void SqliteDatabase::executeWithRegulator(
   func();
 }
 
+bool SqliteDatabase::deleteFunction(const Regulator& regulator, kj::StringPtr name, int argc) {
+  // Check authorization to unregister function
+  SQLITE_REQUIRE(regulator.isAllowedName(name), kj::none,
+      kj::str("Not authorized to unregister SQL function: ", name));
+
+  sqlite3* db = &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
+
+  // Unregister the function with SQLite (by passing NULL as the function pointer)
+  int result = sqlite3_create_function_v2(db,  // Database handle
+      name.cStr(),                             // Function name
+      argc,                                    // Number of arguments (-1 for variable)
+      SQLITE_UTF8,                             // Text encoding
+      nullptr,                                 // User data
+      nullptr,                                 // Function callback (NULL = unregister)
+      nullptr,                                 // No aggregate step function
+      nullptr,                                 // No aggregate final function
+      nullptr);                                // No destructor callback
+
+  return result == SQLITE_OK;
+}
+
+//  Structure and functions for the kj::Function-based UDF approach
+
+// Structure to hold a kj::Function callback
+struct FunctionCallbackData {
+  workerd::SqliteDatabase::SqlFunctionCallback callback;
+};
+
+// Bridge to call the kj::Function from SQLite
+static void sqliteFunctionCallbackBridge(sqlite3_context* context, int argc, sqlite3_value** argv) {
+  // Get the callback data from SQLite
+  auto* data = static_cast<FunctionCallbackData*>(sqlite3_user_data(context));
+  if (data == nullptr) {
+    return;
+  }
+
+  // Convert sqlite3_value** to array of KJ value types
+  auto udfArgs = kj::heapArray<workerd::SqliteDatabase::ValuePtr>(argc);
+
+  for (int i = 0; i < argc; i++) {
+    sqlite3_value* sqliteValue = argv[i];
+
+    // Convert based on the SQLite type
+    int valueType = sqlite3_value_type(sqliteValue);
+
+    switch (valueType) {
+      case SQLITE_INTEGER:
+        udfArgs[i] = static_cast<int64_t>(sqlite3_value_int64(sqliteValue));
+        break;
+
+      case SQLITE_FLOAT:
+        udfArgs[i] = sqlite3_value_double(sqliteValue);
+        break;
+
+      case SQLITE_TEXT: {
+        // For text, follow the pattern from Query::getText
+        const char* ptr = reinterpret_cast<const char*>(sqlite3_value_text(sqliteValue));
+        int length = sqlite3_value_bytes(sqliteValue);
+        udfArgs[i] = kj::StringPtr(ptr, length);
+        break;
+      }
+
+      case SQLITE_BLOB: {
+        // For blobs, follow the pattern from Query::getBlob
+        const byte* ptr = reinterpret_cast<const byte*>(sqlite3_value_blob(sqliteValue));
+        int size = sqlite3_value_bytes(sqliteValue);
+        udfArgs[i] = kj::arrayPtr(ptr, size);
+        break;
+      }
+
+      case SQLITE_NULL:
+      default:
+        udfArgs[i] = nullptr;
+        break;
+    }
+  }
+
+  try {
+    // Call the callback with the UDF arguments and get the result
+    auto result = data->callback(udfArgs);
+
+    // Set the result based on the returned value
+    KJ_SWITCH_ONEOF(result) {
+      KJ_CASE_ONEOF(intValue, int64_t) {
+        sqlite3_result_int64(context, intValue);
+      }
+      KJ_CASE_ONEOF(doubleValue, double) {
+        sqlite3_result_double(context, doubleValue);
+      }
+      KJ_CASE_ONEOF(text, kj::String) {
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the string data
+        sqlite3_result_text(context, text.cStr(), text.size(), SQLITE_TRANSIENT);
+      }
+      KJ_CASE_ONEOF(blob, kj::Array<byte>) {
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the data
+        sqlite3_result_blob(context, blob.begin(), blob.size(), SQLITE_TRANSIENT);
+      }
+      KJ_CASE_ONEOF(nullValue, decltype(nullptr)) {
+        sqlite3_result_null(context);
+      }
+    }
+  } catch (kj::Exception& e) {
+    // Handle like VFS errors - store in vfsErrorListener to be rethrown later
+    if (vfsErrorListener != nullptr) {
+      // Only capture if there's not already an error
+      if (*vfsErrorListener == kj::none) {
+        *vfsErrorListener = kj::mv(e);
+      }
+    }
+
+    // Also report to SQLite so the query will fail if not rethrown
+    sqlite3_result_error(context, e.getDescription().cStr(), -1);
+  } catch (...) {
+    // For non-KJ exceptions, we can only report to SQLite
+    sqlite3_result_error(context, "Unknown error in SQL function", -1);
+  }
+}
+
+// Destructor for FunctionCallbackData
+static void functionCallbackDataDestructor(void* data) {
+  delete static_cast<FunctionCallbackData*>(data);
+}
+
+// Implementation of registerFunctionCallback
+bool SqliteDatabase::registerFunctionCallback(
+    const Regulator& regulator, kj::StringPtr name, SqlFunctionCallback callback) {
+  // Check authorization to register function
+  SQLITE_REQUIRE(regulator.isAllowedName(name), kj::none,
+      kj::str("Not authorized to register SQL function: ", name));
+
+  // Create a new callback data object
+  auto* data = new FunctionCallbackData{.callback = kj::mv(callback)};
+
+  // Register with SQLite with variable arguments
+  sqlite3* db = &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
+
+  int result = sqlite3_create_function_v2(db,  // Database handle
+      name.cStr(),                             // Function name
+      -1,                                      // Number of arguments (-1 for variable)
+      SQLITE_UTF8,                             // Text encoding
+      data,                                    // User data
+      &sqliteFunctionCallbackBridge,           // Function callback
+      nullptr,                                 // No aggregate step function
+      nullptr,                                 // No aggregate final function
+      &functionCallbackDataDestructor);        // Destructor callback
+
+  return result == SQLITE_OK;
+}
+
 void SqliteDatabase::reset() {
   KJ_REQUIRE(!readOnly, "can't reset() read-only database");
 
@@ -1139,7 +1324,8 @@ bool SqliteDatabase::isAuthorized(int actionCode,
         }
         return result;
       }();
-      return allowSet.contains(KJ_ASSERT_NONNULL(param2));
+      auto funcName = KJ_ASSERT_NONNULL(param2);
+      return allowSet.contains(funcName) || regulator.isUserDefinedFunction(funcName);
     }
 
       // ---------------------------------------------------------------
@@ -1522,7 +1708,7 @@ uint SqliteDatabase::Query::columnCount() {
   return sqlite3_column_count(statement);
 }
 
-SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
+SqliteDatabase::ValuePtr SqliteDatabase::Query::getValue(uint column) {
   sqlite3_stmt* statement = getStatement();
   switch (sqlite3_column_type(statement, column)) {
     case SQLITE_INTEGER:
@@ -2504,5 +2690,8 @@ kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
 #endif
 
 // =======================================================================================
+
+// SqliteValue class has been removed. Logic for handling SQLite values is now
+// performed directly in the UDF callback using KJ types.
 
 }  // namespace workerd

@@ -17,6 +17,8 @@
 struct sqlite3;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
+struct sqlite3_context;
+struct sqlite3_value;
 
 KJ_DECLARE_NON_POLYMORPHIC(sqlite3_stmt);
 
@@ -24,6 +26,10 @@ namespace workerd {
 
 using kj::byte;
 using kj::uint;
+
+// Function to check if we're currently inside a SQLite call
+// This is used to prevent reentrancy in UDFs
+bool isSqliteCallActive();
 
 // Used to collect periodic metrics about queries and size of sqlite db
 class SqliteObserver {
@@ -121,6 +127,13 @@ class SqliteDatabase {
       return false;
     }
 
+    // Returns whether the given function name is a user-defined function that should be allowed
+    // to run. This is used to authorize functions that have been registered through the UDF API
+    // but are not part of the standard allowed SQLite functions.
+    virtual bool isUserDefinedFunction(kj::StringPtr name) const {
+      return false;
+    }
+
     // Report that an error occurred. `message` is the detail message constructed by SQLite. This
     // function should typically throw an exception. If no exception is thrown, a simple KJ exception
     // will be thrown after `onError()` returns.
@@ -131,7 +144,12 @@ class SqliteDatabase {
     // KJ exceptions in all cases. This is because SQLITE_MISUSE indicates a bug that could lead to
     // undefined behavior. Such bugs are always in C++ code; JavaScript application code must be
     // prohibited from causing such errors in the first place.
-    virtual void onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {}
+    //
+    // When the error is from a UDF function, `error` will contain the actual KJ exception that
+    // was thrown from the UDF. This allows proper error handling for UDF errors.
+    virtual void onError(kj::Maybe<int> sqliteErrorCode,
+        kj::StringPtr message,
+        kj::Maybe<const kj::Exception&> error = kj::none) const {}
 
     // Are BEGIN TRANSACTION and SAVEPOINT statements allowed? Note that if allowed, SAVEPOINT will
     // also be subject to `isAllowedName()` for the savepoint name. If denied, the application will
@@ -231,6 +249,26 @@ class SqliteDatabase {
 
   // Execute a function with the given regulator.
   void executeWithRegulator(const Regulator& regulator, kj::FunctionParam<void()> func);
+
+  // Basic SQLite C callback and destructor types
+  using SqliteCallback = void (*)(sqlite3_context*, int, sqlite3_value**);
+  using SqliteDestructor = void (*)(void*);
+
+  // Basic value type for representing SQLite values as native types
+  using ValuePtr =
+      kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
+
+  // Function callback for SQL UDFs, returning owned types to ensure values persist until SQLite is done with them
+  using SqlFunctionCallback =
+      kj::Function<kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)>(
+          kj::ArrayPtr<const ValuePtr>)>;
+
+  // Register a custom function with SQLite using modern kj::Function callback approach
+  bool registerFunctionCallback(
+      const Regulator& regulator, kj::StringPtr name, SqlFunctionCallback callback);
+
+  // Unregister a custom function
+  bool deleteFunction(const Regulator& regulator, kj::StringPtr name, int argc = -1);
 
   // Resets the database to an empty state by deleting the underlying database file and creating
   // a new one in its place. This is the recommended way to "drop database" in SQLite, and is used
@@ -467,9 +505,6 @@ class SqliteDatabase::Statement final: private ResetListener {
 // the stack.
 class SqliteDatabase::Query final: private ResetListener {
  public:
-  using ValuePtr =
-      kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
-
   // Construct using Statement::run() or SqliteDatabase::run().
 
   ~Query() noexcept(false);

@@ -431,6 +431,14 @@ wd_test(
     data = ["sql-test.js"],
 )
 
+# Comprehensive SQL UDF test file
+wd_test(
+    size = "large",
+    src = "sql-udf-test.wd-test",
+    args = ["--experimental"],
+    data = ["sql-udf-test.js"],
+)
+
 wd_test(
     src = "streams/identitytransformstream-backpressure-test.wd-test",
     args = ["--experimental"],

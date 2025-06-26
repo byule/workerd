@@ -7,8 +7,16 @@
 #include "actor-state.h"
 
 #include <workerd/io/io-context.h>
+#include <workerd/jsg/function.h>
+#include <workerd/jsg/util.h>
+#include <workerd/util/sqlite.h>
 
 namespace workerd::api {
+
+// Thread-local storage for JavaScript error message and stack
+thread_local kj::String SqlStorage::lastErrorMessage;
+thread_local kj::String SqlStorage::lastErrorStack;
+thread_local bool SqlStorage::hasJsException = false;
 
 // Maximum total size of all cached statements (measured in size of the SQL code). If cached
 // statements exceed this, we remove the LRU statement(s).
@@ -21,7 +29,9 @@ SqlStorage::SqlStorage(jsg::Ref<DurableObjectStorage> storage)
     : storage(kj::mv(storage)),
       statementCache(IoContext::current().addObject(kj::heap<StatementCache>())) {}
 
-SqlStorage::~SqlStorage() {}
+SqlStorage::~SqlStorage() {
+  // Nothing to clean up - the jsFunctions HashMap is cleaned up automatically
+}
 
 jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
     jsg::Lock& js, jsg::JsString querySql, jsg::Arguments<BindingValue> bindings) {
@@ -87,6 +97,319 @@ jsg::Ref<SqlStorage::Statement> SqlStorage::prepare(jsg::Lock& js, jsg::JsString
   return js.alloc<Statement>(js, JSG_THIS, query);
 }
 
+void SqlStorage::ensureBuiltInFunctionsInitialized(jsg::Lock& js) {
+  // Only initialize if the set is empty
+  if (builtInFunctions.size() == 0) {
+    auto& db = getDb(js);
+
+    // Query the database for all built-in functions
+    auto query = db.run(SqliteDatabase::TRUSTED, "PRAGMA function_list;");
+
+    // Process each row
+    while (!query.isDone()) {
+      auto name = query.getText(0);  // First column is the function name
+
+      // Convert to lowercase for case-insensitive checks
+      auto lowercase = kj::heapString(name.size());
+      for (size_t i = 0; i < name.size(); i++) {
+        lowercase[i] = tolower(name[i]);
+      }
+
+      // Only insert if not already present
+      if (builtInFunctions.find(lowercase) == kj::none) {
+        builtInFunctions.insert(kj::mv(lowercase));
+      }
+
+      query.nextRow();
+    }
+  }
+}
+
+void SqlStorage::createFunction(jsg::Lock& js, jsg::JsString name, jsg::JsValue functionValue) {
+  // Validate that the function parameter is actually a function
+  JSG_REQUIRE(functionValue.isFunction(), TypeError, "Expected a function as the second argument");
+
+  // Get the function as a V8 function object and verify it's not async
+  v8::Local<v8::Value> funcValue = functionValue;
+  v8::Local<v8::Function> funcObj = v8::Local<v8::Function>::Cast(funcValue);
+  JSG_REQUIRE(!funcObj->IsAsyncFunction(), TypeError,
+      "Async functions are not supported in SQL UDFs. Please use a regular synchronous function.");
+
+  // Also check if the function returns a Promise by calling it with no arguments
+  // and checking the result. This catches regular functions that return Promises.
+  {
+    v8::TryCatch tryCatch(js.v8Isolate);
+    v8::Local<v8::Context> context = js.v8Isolate->GetCurrentContext();
+    v8::Local<v8::Value> thisArg = v8::Undefined(js.v8Isolate);
+    v8::MaybeLocal<v8::Value> result = funcObj->Call(context, thisArg, 0, nullptr);
+
+    // Only check for Promise return if the call didn't throw
+    if (!tryCatch.HasCaught() && !result.IsEmpty()) {
+      v8::Local<v8::Value> returnValue = result.ToLocalChecked();
+      if (returnValue->IsPromise()) {
+        JSG_FAIL_REQUIRE(TypeError,
+            "Functions that return Promises are not supported in SQL UDFs. "
+            "SQL UDFs must return values synchronously.");
+      }
+    }
+  }
+
+  // Convert to a string for use in the registration
+  auto nameStr = js.toString(name);
+
+  // Check the function name length - SQLite has a limit of 255 bytes for function names
+  JSG_REQUIRE(nameStr.size() <= MAX_UDF_NAME_LENGTH, Error,
+      kj::str("Function name exceeds maximum length (", MAX_UDF_NAME_LENGTH, ")"));
+
+  // First ensure we've initialized our built-in functions list
+  ensureBuiltInFunctionsInitialized(js);
+
+  // Convert name to lowercase for case-insensitive check
+  auto lowercaseName = kj::heapString(nameStr.size());
+  for (size_t i = 0; i < nameStr.size(); i++) {
+    lowercaseName[i] = tolower(nameStr[i]);
+  }
+
+  // Check against built-in functions
+  if (builtInFunctions.find(lowercaseName) != kj::none) {
+    JSG_FAIL_REQUIRE(Error, kj::str("Cannot override built-in SQLite function '", nameStr, "'"));
+  }
+
+  // Check if the function is already registered
+  if (jsFunctions.find(nameStr) != kj::none) {
+    // Unregister existing function first
+    deleteFunction(js, name);
+  } else {
+    // If this is a new function, check UDF count limit
+    JSG_REQUIRE(jsFunctions.size() < MAX_UDF_COUNT, Error,
+        kj::str("Maximum number of user-defined functions (", MAX_UDF_COUNT, ") exceeded"));
+  }
+
+  // Get the database
+  auto& db = getDb(js);
+
+  auto callback = [funcRef = jsg::JsRef<jsg::JsValue>(js, functionValue), isolate = js.v8Isolate,
+                      funcName = kj::str(nameStr)](
+                      kj::ArrayPtr<const SqliteDatabase::ValuePtr> udfArgs)
+      -> kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)> {
+    // Check for reentrancy to prevent deadlocks and corruption
+    if (isSqliteCallActive()) {
+      KJ_FAIL_REQUIRE(
+          "SQL User-Defined Function cannot call back into SQLite (reentrancy detected)");
+    }
+
+    // Get the current JavaScript context
+    jsg::Lock& js = jsg::Lock::from(isolate);
+    v8::HandleScope handleScope(isolate);
+
+    // Get the function from the reference
+    v8::Local<v8::Value> funcValue = funcRef.getHandle(js);
+
+    // Make sure it's a function
+    if (!funcValue->IsFunction()) {
+      // TODO: Handle error more elegantly
+      KJ_FAIL_REQUIRE("UDF is not a function");
+    }
+
+    // Use a TryCatch to capture any exceptions thrown during function execution
+    v8::TryCatch tryCatch(isolate);
+
+    // Convert the KJ values to JavaScript values
+    auto jsArgs = kj::heapArray<v8::Local<v8::Value>>(udfArgs.size());
+
+    for (size_t i = 0; i < udfArgs.size(); i++) {
+      // First convert the ValuePtr to SqlValue (similar to what happens in iteratorImpl)
+      SqlValue value;
+
+      KJ_SWITCH_ONEOF(udfArgs[i]) {
+        KJ_CASE_ONEOF(blobPtr, kj::ArrayPtr<const byte>) {
+          // Clone the blob data into a new array - this may be necessary for longevity
+          value.emplace(kj::heapArray(blobPtr));
+        }
+        KJ_CASE_ONEOF(text, kj::StringPtr) {
+          // StringPtr is valid during the callback and immediately converted to JS
+          value.emplace(text);
+        }
+        KJ_CASE_ONEOF(intValue, int64_t) {
+          // Convert to double like we do in iteratorImpl for consistency
+          value.emplace(static_cast<double>(intValue));
+        }
+        KJ_CASE_ONEOF(doubleValue, double) {
+          value.emplace(doubleValue);
+        }
+        KJ_CASE_ONEOF(nullValue, decltype(nullptr)) {
+          // Leave value as null
+        }
+      }
+
+      // Then use the existing wrapSqlValue function to convert to JS
+      jsArgs[i] = wrapSqlValue(js, kj::mv(value));
+    }
+
+    // Call the function
+    v8::Local<v8::Function> func = v8::Local<v8::Function>::Cast(funcValue);
+    v8::Local<v8::Value> thisObj = v8::Undefined(isolate);
+    v8::Local<v8::Context> v8Context = isolate->GetCurrentContext();
+
+    v8::MaybeLocal<v8::Value> maybeResult = func->Call(
+        v8Context, thisObj, udfArgs.size(), udfArgs.size() > 0 ? jsArgs.begin() : nullptr);
+
+    // Handle any Javascript exceptions that were thrown and uncaught
+    if (maybeResult.IsEmpty()) {
+      v8::Local<v8::Value> jsException = tryCatch.Exception();
+
+      // Extract message and stack from the exception
+      v8::Local<v8::Context> context = isolate->GetCurrentContext();
+      v8::Local<v8::String> messageKey =
+          v8::String::NewFromUtf8(isolate, "message").ToLocalChecked();
+      v8::Local<v8::String> stackKey = v8::String::NewFromUtf8(isolate, "stack").ToLocalChecked();
+      v8::Local<v8::String> nameKey = v8::String::NewFromUtf8(isolate, "name").ToLocalChecked();
+
+      // Store UDF name for better error messages
+      kj::String functionNameCopy = kj::heapString(funcName);
+
+      // Store error message and additional context
+      if (jsException->IsObject()) {
+        v8::Local<v8::Object> jsExceptionObj = jsException->ToObject(context).ToLocalChecked();
+
+        // Get error type/name
+        kj::String errorType = kj::heapString("Error");
+        if (jsExceptionObj->Has(context, nameKey).FromMaybe(false)) {
+          v8::Local<v8::Value> nameValue = jsExceptionObj->Get(context, nameKey).ToLocalChecked();
+          if (nameValue->IsString()) {
+            v8::Local<v8::String> nameStr = nameValue.As<v8::String>();
+            v8::String::Utf8Value name(isolate, nameStr);
+            errorType = kj::heapString(*name, name.length());
+          }
+        }
+
+        // Get message
+        kj::String errorMessage = kj::heapString("Unknown error");
+        if (jsExceptionObj->Has(context, messageKey).FromMaybe(false)) {
+          v8::Local<v8::Value> messageValue =
+              jsExceptionObj->Get(context, messageKey).ToLocalChecked();
+          if (messageValue->IsString()) {
+            v8::Local<v8::String> messageStr = messageValue.As<v8::String>();
+            v8::String::Utf8Value message(isolate, messageStr);
+            errorMessage = kj::heapString(*message, message.length());
+          }
+        }
+
+        // Create a more detailed error message that includes the UDF name and error details
+        lastErrorMessage =
+            kj::str(errorType, " in SQL UDF '", functionNameCopy, "': ", errorMessage);
+
+        // Make sure to output the message to the console for debugging
+        fprintf(stderr, "SQL UDF Error: %s\n", lastErrorMessage.cStr());
+
+        // Get stack trace
+        if (jsExceptionObj->Has(context, stackKey).FromMaybe(false)) {
+          v8::Local<v8::Value> stackValue = jsExceptionObj->Get(context, stackKey).ToLocalChecked();
+          if (stackValue->IsString()) {
+            v8::Local<v8::String> stackStr = stackValue.As<v8::String>();
+            v8::String::Utf8Value stack(isolate, stackStr);
+            lastErrorStack = kj::heapString(*stack, stack.length());
+          }
+        }
+      } else {
+        // Fallback if it's not an object
+        v8::String::Utf8Value exceptionStr(isolate, jsException);
+        lastErrorMessage = kj::str("Error in SQL UDF '", functionNameCopy,
+            "': ", kj::heapString(*exceptionStr, exceptionStr.length()));
+        lastErrorStack = kj::heapString("");
+      }
+
+      hasJsException = true;
+
+      // Throw a simple KJ exception to signal that an error occurred
+      // We'll create a proper JS error with the saved details in onError
+      kj::throwFatalException(kj::Exception(kj::Exception::Type::FAILED, "SQL UDF", __LINE__,
+          kj::str("JavaScript error in UDF '", functionNameCopy, "'")));
+    }
+
+    // Get the JavaScript result
+    v8::Local<v8::Value> jsResult = maybeResult.ToLocalChecked();
+
+    // Convert based on the JS type
+    if (jsResult->IsNull() || jsResult->IsUndefined()) {
+      return nullptr;
+    } else if (jsResult->IsInt32() || jsResult->IsUint32()) {
+      return static_cast<int64_t>(jsResult->IntegerValue(v8Context).ToChecked());
+    } else if (jsResult->IsNumber()) {
+      double num = jsResult->NumberValue(v8Context).ToChecked();
+      if (num == static_cast<int64_t>(num)) {
+        return static_cast<int64_t>(num);
+      } else {
+        return num;
+      }
+    } else if (jsResult->IsString()) {
+      // Convert JS string to owned kj::String for safe lifetime management
+      return js.toString(jsResult);
+    } else if (jsResult->IsBoolean()) {
+      return static_cast<int64_t>(jsResult->BooleanValue(isolate) ? 1 : 0);
+    } else if (jsResult->IsArrayBuffer()) {
+      v8::Local<v8::ArrayBuffer> arrayBuffer = v8::Local<v8::ArrayBuffer>::Cast(jsResult);
+      auto backingStore = arrayBuffer->GetBackingStore();
+
+      // Create an owned copy of the ArrayBuffer data
+      auto size = backingStore->ByteLength();
+      auto copy = kj::heapArray<byte>(size);
+
+      if (size > 0) {
+        memcpy(copy.begin(), backingStore->Data(), size);
+      }
+
+      return kj::mv(copy);
+    } else if (jsResult->IsUint8Array() || jsResult->IsInt8Array() ||
+        jsResult->IsUint8ClampedArray()) {
+      v8::Local<v8::TypedArray> typedArray = v8::Local<v8::TypedArray>::Cast(jsResult);
+      auto buffer = typedArray->Buffer();
+      auto backingStore = buffer->GetBackingStore();
+      auto byteOffset = typedArray->ByteOffset();
+      auto byteLength = typedArray->ByteLength();
+
+      // Create an owned copy of the TypedArray data
+      auto copy = kj::heapArray<byte>(byteLength);
+
+      if (byteLength > 0) {
+        memcpy(
+            copy.begin(), static_cast<const byte*>(backingStore->Data()) + byteOffset, byteLength);
+      }
+
+      return kj::mv(copy);
+    } else {
+      // TODO: Throw a more specific error
+      return nullptr;
+    }
+  };
+
+  // Store in our function map for GC tracking
+  JsFunction jsFunc = {.function = jsg::JsRef<jsg::JsValue>(js, functionValue)};
+  jsFunctions.insert(kj::heapString(nameStr), kj::mv(jsFunc));
+
+  // Register with the modern callback API
+  bool success = db.registerFunctionCallback(*this, nameStr, kj::mv(callback));
+
+  if (!success) {
+    // Clean up if registration failed
+    jsFunctions.erase(nameStr);
+    JSG_REQUIRE(false, Error, kj::str("Failed to register SQL function: ", nameStr));
+  }
+}
+
+void SqlStorage::deleteFunction(jsg::Lock& js, jsg::JsString name) {
+  auto nameStr = js.toString(name);
+
+  // Get the database
+  auto& db = getDb(js);
+
+  // Remove function from SQLite
+  db.deleteFunction(*this, nameStr);
+
+  // Remove function from our map
+  jsFunctions.erase(nameStr);
+}
+
 double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   auto& db = getDb(js);
   int64_t pages = execMemoized(db, pragmaPageCount,
@@ -103,8 +426,80 @@ bool SqlStorage::isAllowedTrigger(kj::StringPtr name) const {
   return true;
 }
 
-void SqlStorage::onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
-  JSG_ASSERT(false, Error, message);
+bool SqlStorage::isUserDefinedFunction(kj::StringPtr name) const {
+  // Case-insensitive function lookup - check if we find a case-insensitive match
+  for (const auto& entry: jsFunctions) {
+    // Compare case-insensitively
+    if (strcasecmp(entry.key.cStr(), name.cStr()) == 0) {
+      return true;
+    }
+  }
+
+  // No match found
+  return false;
+}
+
+// Called by SQLite when an error occurs during SQL execution. This method directly throws
+// a JavaScript exception with the SQLite error message.
+//
+// For errors from UDFs, we check if we have a stored JavaScript exception in thread-local storage
+// and throw that instead of a generic error message. This preserves the full stack trace.
+void SqlStorage::onError(kj::Maybe<int> sqliteErrorCode,
+    kj::StringPtr message,
+    kj::Maybe<const kj::Exception&> exception) const {
+  auto& ioContext = IoContext::current();
+  jsg::Lock& js = ioContext.getCurrentLock();
+
+  // Check if we have a stored JavaScript exception from a UDF
+  if (hasJsException) {
+    // Clear the flag to prevent leaking to next operation
+    hasJsException = false;
+
+    // Create a new error object with the stored message and stack
+    v8::Isolate* isolate = js.v8Isolate;
+    v8::HandleScope handleScope(isolate);
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+    // Create an Error object with our stored message
+    v8::Local<v8::String> errorMsg = v8::String::NewFromUtf8(
+        isolate, lastErrorMessage.begin(), v8::NewStringType::kNormal, lastErrorMessage.size())
+                                         .ToLocalChecked();
+
+    v8::Local<v8::Value> error = v8::Exception::Error(errorMsg);
+
+    // Add the stack property if we have it
+    if (lastErrorStack.size() > 0) {
+      v8::Local<v8::Object> errorObj = error->ToObject(context).ToLocalChecked();
+      v8::Local<v8::String> stackKey = v8::String::NewFromUtf8(isolate, "stack").ToLocalChecked();
+      v8::Local<v8::String> stackValue = v8::String::NewFromUtf8(
+          isolate, lastErrorStack.begin(), v8::NewStringType::kNormal, lastErrorStack.size())
+                                             .ToLocalChecked();
+
+      // Set the stack property
+      errorObj->Set(context, stackKey, stackValue).Check();
+    }
+
+    // Clear the stored data
+    lastErrorMessage = kj::heapString("");
+    lastErrorStack = kj::heapString("");
+
+    // Throw the reconstructed error
+    isolate->ThrowException(error);
+
+    // Create and throw a JSG error with a more specific approach that preserves our message
+    // Instead of using JSG_FAIL_REQUIRE which might not correctly use our message, we'll
+    // throw directly from the V8 exception we already created
+    throw jsg::JsExceptionThrown();
+
+    // Don't need to explicitly return since JSG_FAIL_REQUIRE doesn't return
+  } else if (exception != kj::none) {
+    // If we have a regular KJ exception, convert it to a JS exception
+    auto jsException = js.exceptionToJs(kj::Exception(KJ_REQUIRE_NONNULL(exception)));
+    js.throwException(kj::mv(jsException));
+  } else {
+    // Just throw a basic error with the SQLite error message
+    JSG_ASSERT(false, Error, message);
+  }
 }
 
 bool SqlStorage::allowTransactions() const {
@@ -357,9 +752,9 @@ void SqlStorage::Cursor::endQuery(State& stateRef) {
   state = kj::none;
 }
 
-kj::Array<const SqliteDatabase::Query::ValuePtr> SqlStorage::Cursor::mapBindings(
+kj::Array<const SqliteDatabase::ValuePtr> SqlStorage::Cursor::mapBindings(
     kj::ArrayPtr<BindingValue> values) {
-  return KJ_MAP(value, values) -> SqliteDatabase::Query::ValuePtr {
+  return KJ_MAP(value, values) -> SqliteDatabase::ValuePtr {
     KJ_IF_SOME(v, value) {
       KJ_SWITCH_ONEOF(v) {
         KJ_CASE_ONEOF(data, kj::Array<const byte>) {
@@ -394,6 +789,11 @@ void SqlStorage::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
   if (pragmaGetMaxPageCount != kj::none) {
     tracker.trackFieldWithSize(
         "IoPtr<SqllitDatabase::Statement>", sizeof(IoPtr<SqliteDatabase::Statement>));
+  }
+
+  // Track JavaScript UDFs
+  for (auto& entry: jsFunctions) {
+    tracker.trackField("jsFunction", entry.value.function);
   }
 }
 

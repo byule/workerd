@@ -10,7 +10,9 @@
 
 namespace workerd {
 
-void SqliteKvRegulator::onError(kj::Maybe<int> sqliteErrorCode, kj::StringPtr message) const {
+void SqliteKvRegulator::onError(kj::Maybe<int> sqliteErrorCode,
+    kj::StringPtr message,
+    kj::Maybe<const kj::Exception&> error) const {
   KJ_IF_SOME(ec, sqliteErrorCode) {
     switch (ec) {
       case SQLITE_TOOBIG:
