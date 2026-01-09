@@ -28,6 +28,7 @@
 #include <kj/vector.h>
 
 #include <atomic>
+#include <exception>
 
 #if _WIN32
 #define strncasecmp _strnicmp
@@ -263,6 +264,22 @@ kj::Maybe<kj::StringPtr> toMaybeString(const char* cstr) {
   } else {
     return kj::StringPtr(cstr);
   }
+}
+
+// Helper function to convert a string to lowercase.
+// SQLite function names are case-insensitive, so we normalize to lowercase for HashMap lookups.
+kj::String toLowercase(kj::StringPtr str) {
+  auto result = kj::heapString(str.size());
+  for (auto i: kj::zeroTo(str.size())) {
+    char c = str[i];
+    // ASCII lowercase conversion
+    if (c >= 'A' && c <= 'Z') {
+      result[i] = c + ('a' - 'A');
+    } else {
+      result[i] = c;
+    }
+  }
+  return result;
 }
 
 // We allowlist these SQLite functions.
@@ -691,7 +708,7 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(const Regulator& r
   currentParseContext = parseContext;
 
   KJ_ASSERT(currentRegulator == kj::none,
-      "can't prepare statements inside executeWithRegulator() callback");
+      "cannot execute SQL queries recursively, such as in a user-defined function");
   KJ_DEFER(currentRegulator = kj::none);
   currentRegulator = regulator;
 
@@ -1151,6 +1168,23 @@ bool SqliteDatabase::isAuthorized(int actionCode,
 
     case SQLITE_FUNCTION: /* NULL            Function Name   */
     {
+      kj::StringPtr funcName = KJ_ASSERT_NONNULL(param2);
+
+      // SQLite function names are case-insensitive, so we normalize to lowercase for lookups.
+      // The ALLOWED_SQLITE_FUNCTIONS are already lowercase, and UDFs are stored with lowercase keys.
+      auto lowerFuncName = toLowercase(funcName);
+
+      // Check if it's a registered scalar user-defined function
+      if (registeredUdfs.find(lowerFuncName) != kj::none) {
+        return true;
+      }
+
+      // Check if it's a registered aggregate user-defined function
+      if (registeredAggregateUdfs.find(lowerFuncName) != kj::none) {
+        return true;
+      }
+
+      // Check if it's an allowed built-in function
       static const kj::HashSet<kj::StringPtr> allowSet = []() {
         kj::HashSet<kj::StringPtr> result;
         for (const kj::StringPtr& func: ALLOWED_SQLITE_FUNCTIONS) {
@@ -1158,7 +1192,7 @@ bool SqliteDatabase::isAuthorized(int actionCode,
         }
         return result;
       }();
-      return allowSet.contains(KJ_ASSERT_NONNULL(param2));
+      return allowSet.contains(lowerFuncName);
     }
 
       // ---------------------------------------------------------------
@@ -1519,6 +1553,15 @@ void SqliteDatabase::Query::nextRow(bool first) {
     if (err == SQLITE_DONE) {
       done = true;
     } else if (err != SQLITE_ROW) {
+      // Check if a UDF threw an exception. If so, rethrow it instead of the generic SQLite error.
+      // This preserves the full exception including tunneled JS exceptions with their stack traces.
+      // Note: We must move the exception out before clearing pendingUdfException, because
+      // KJ_IF_SOME gives us a reference that becomes dangling if we clear first.
+      KJ_IF_SOME(e, db.pendingUdfException) {
+        auto exception = kj::mv(e);
+        db.pendingUdfException = kj::none;
+        kj::throwFatalException(kj::mv(exception));
+      }
       SQLITE_CALL_FAILED("sqlite3_step()", err);
     }
   }
@@ -2539,5 +2582,252 @@ kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
 #endif
 
 // =======================================================================================
+// UDF Implementation
+// =======================================================================================
+
+// Define the RegisteredUdf structure here in the implementation file.
+// This is used for scalar functions.
+struct SqliteDatabase::RegisteredUdf {
+  kj::String name;
+  ScalarUdfCallback callback;
+  SqliteDatabase* db;  // Pointer to the database so we can store pending exceptions
+};
+
+// Structure for aggregate functions.
+struct SqliteDatabase::RegisteredAggregateUdf {
+  kj::String name;
+  SqliteDatabase::AggregateStepCallback stepCallback;
+  SqliteDatabase::AggregateFinalCallback finalCallback;
+  SqliteDatabase* db;  // Pointer to the database so we can store pending exceptions
+};
+
+// State stored in sqlite3_aggregate_context for aggregate functions.
+// We store a pointer to a heap-allocated UdfResultValue to hold the accumulated state.
+struct AggregateState {
+  kj::Maybe<SqliteDatabase::UdfResultValue> value;
+  bool initialized = false;
+};
+
+// Helper to convert sqlite3_value to UdfArgValue (non-owning)
+static SqliteDatabase::UdfArgValue sqliteValueToUdfArgValue(sqlite3_value* value) {
+  switch (sqlite3_value_type(value)) {
+    case SQLITE_INTEGER:
+      return static_cast<int64_t>(sqlite3_value_int64(value));
+    case SQLITE_FLOAT:
+      return sqlite3_value_double(value);
+    case SQLITE_TEXT: {
+      const unsigned char* text = sqlite3_value_text(value);
+      if (text == nullptr) {
+        return kj::StringPtr("");
+      }
+      return kj::StringPtr(reinterpret_cast<const char*>(text));
+    }
+    case SQLITE_BLOB: {
+      const void* blob = sqlite3_value_blob(value);
+      int size = sqlite3_value_bytes(value);
+      if (blob == nullptr || size == 0) {
+        return kj::ArrayPtr<const byte>(static_cast<const byte*>(nullptr), static_cast<size_t>(0));
+      }
+      return kj::ArrayPtr<const byte>(static_cast<const byte*>(blob), static_cast<size_t>(size));
+    }
+    case SQLITE_NULL:
+    default:
+      return nullptr;
+  }
+}
+
+// Helper to set the result from a UdfResultValue (owning)
+static void setResultFromUdfResultValue(
+    sqlite3_context* ctx, const SqliteDatabase::UdfResultValue& value) {
+  KJ_SWITCH_ONEOF(value) {
+    KJ_CASE_ONEOF(intVal, int64_t) {
+      sqlite3_result_int64(ctx, intVal);
+    }
+    KJ_CASE_ONEOF(doubleVal, double) {
+      sqlite3_result_double(ctx, doubleVal);
+    }
+    KJ_CASE_ONEOF(strVal, kj::String) {
+      sqlite3_result_text(ctx, strVal.cStr(), strVal.size(), SQLITE_TRANSIENT);
+    }
+    KJ_CASE_ONEOF(blobVal, kj::Array<byte>) {
+      sqlite3_result_blob(ctx, blobVal.begin(), blobVal.size(), SQLITE_TRANSIENT);
+    }
+    KJ_CASE_ONEOF(nullVal, decltype(nullptr)) {
+      sqlite3_result_null(ctx);
+    }
+  }
+}
+
+// Static callback that SQLite calls when a UDF is invoked.
+// The user_data parameter points to a RegisteredUdf structure.
+static void udfCallback(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  auto* udf = static_cast<SqliteDatabase::RegisteredUdf*>(sqlite3_user_data(ctx));
+
+  // Convert arguments to UdfArgValue array (non-owning pointers to SQLite-managed memory)
+  auto args = kj::heapArray<SqliteDatabase::UdfArgValue>(argc);
+  for (auto i: kj::zeroTo(argc)) {
+    args[i] = sqliteValueToUdfArgValue(argv[i]);
+  }
+
+  // Call the user's callback
+  try {
+    auto result = udf->callback(args);
+    setResultFromUdfResultValue(ctx, result);
+  } catch (kj::Exception& e) {
+    // Store the exception so we can rethrow it after sqlite3_step() returns.
+    // This preserves the full exception (including tunneled JS exceptions with stack traces).
+    // We still need to tell SQLite there was an error, but the message here doesn't matter
+    // since we'll rethrow the real exception.
+    udf->db->setPendingUdfException(kj::mv(e));
+    sqlite3_result_error(ctx, "UDF error", -1);
+  } catch (std::exception& e) {
+    sqlite3_result_error(ctx, e.what(), -1);
+  } catch (...) {
+    sqlite3_result_error(ctx, "Unknown error in UDF", -1);
+  }
+}
+
+void SqliteDatabase::registerScalarFunction(
+    kj::StringPtr name, int argCount, ScalarUdfCallback callback) {
+  sqlite3* sqliteDb = &KJ_ASSERT_NONNULL(maybeDb, "database not open");
+
+  // Create the RegisteredUdf structure to hold the callback
+  auto udf = kj::heap<RegisteredUdf>();
+  // Store the name in lowercase for case-insensitive lookup in the authorizer.
+  // SQLite function names are case-insensitive.
+  udf->name = toLowercase(name);
+  udf->callback = kj::mv(callback);
+  udf->db = this;  // Store pointer to database for exception handling
+
+  // Register with SQLite using the original name (SQLite handles case-insensitivity internally)
+  int rc = sqlite3_create_function_v2(sqliteDb, name.cStr(), argCount, SQLITE_UTF8,
+      udf.get(),  // user_data
+      udfCallback,
+      nullptr,  // xStep (for aggregate functions)
+      nullptr,  // xFinal (for aggregate functions)
+      nullptr   // xDestroy (we manage lifetime ourselves)
+  );
+
+  KJ_REQUIRE(rc == SQLITE_OK, "Failed to register UDF", name, sqlite3_errmsg(sqliteDb));
+
+  // Store the UDF so it stays alive.
+  // We need to erase any existing entry first because the HashMap key is a StringPtr
+  // pointing to the RegisteredUdf's name field. If we just upsert, the old key pointer
+  // would become dangling when the old value is destroyed.
+  registeredUdfs.erase(udf->name.asPtr());
+  registeredUdfs.insert(udf->name.asPtr(), kj::mv(udf));
+}
+
+// Static callback for aggregate step function.
+static void aggregateStepCallback(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+  auto* udf = static_cast<SqliteDatabase::RegisteredAggregateUdf*>(sqlite3_user_data(ctx));
+
+  // Get or allocate aggregate context
+  auto* aggCtx =
+      static_cast<AggregateState*>(sqlite3_aggregate_context(ctx, sizeof(AggregateState)));
+  if (aggCtx == nullptr) {
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+
+  // Initialize on first call
+  if (!aggCtx->initialized) {
+    new (aggCtx) AggregateState();
+    aggCtx->initialized = true;
+  }
+
+  // Convert arguments to UdfArgValue array
+  auto args = kj::heapArray<SqliteDatabase::UdfArgValue>(argc);
+  for (auto i: kj::zeroTo(argc)) {
+    args[i] = sqliteValueToUdfArgValue(argv[i]);
+  }
+
+  // Call the user's step callback
+  try {
+    // Pass current state (if any) and get new state
+    kj::Maybe<SqliteDatabase::UdfResultValue&> stateRef;
+    KJ_IF_SOME(v, aggCtx->value) {
+      stateRef = v;
+    }
+    auto newState = udf->stepCallback(stateRef, args);
+    aggCtx->value = kj::mv(newState);
+  } catch (kj::Exception& e) {
+    // Store the exception so we can rethrow it after sqlite3_step() returns.
+    // This preserves the full exception (including tunneled JS exceptions with stack traces).
+    // We still need to tell SQLite there was an error, but the message here doesn't matter
+    // since we'll rethrow the real exception.
+    udf->db->setPendingUdfException(kj::mv(e));
+    sqlite3_result_error(ctx, "Aggregate step error", -1);
+  } catch (std::exception& e) {
+    sqlite3_result_error(ctx, e.what(), -1);
+  } catch (...) {
+    sqlite3_result_error(ctx, "Unknown error in aggregate step", -1);
+  }
+}
+
+// Static callback for aggregate final function.
+static void aggregateFinalCallback(sqlite3_context* ctx) {
+  auto* udf = static_cast<SqliteDatabase::RegisteredAggregateUdf*>(sqlite3_user_data(ctx));
+
+  // Get aggregate context (don't allocate if it doesn't exist - means no rows were processed)
+  auto* aggCtx = static_cast<AggregateState*>(sqlite3_aggregate_context(ctx, 0));
+
+  try {
+    kj::Maybe<SqliteDatabase::UdfResultValue&> stateRef;
+    if (aggCtx != nullptr && aggCtx->initialized) {
+      KJ_IF_SOME(v, aggCtx->value) {
+        stateRef = v;
+      }
+    }
+    auto result = udf->finalCallback(stateRef);
+    setResultFromUdfResultValue(ctx, result);
+  } catch (kj::Exception& e) {
+    udf->db->setPendingUdfException(kj::mv(e));
+    sqlite3_result_error(ctx, "Aggregate final error", -1);
+  } catch (std::exception& e) {
+    sqlite3_result_error(ctx, e.what(), -1);
+  } catch (...) {
+    sqlite3_result_error(ctx, "Unknown error in aggregate final", -1);
+  }
+
+  // Clean up the aggregate state
+  if (aggCtx != nullptr && aggCtx->initialized) {
+    aggCtx->~AggregateState();
+  }
+}
+
+void SqliteDatabase::registerAggregateFunction(kj::StringPtr name,
+    int argCount,
+    AggregateStepCallback stepCallback,
+    AggregateFinalCallback finalCallback) {
+  sqlite3* sqliteDb = &KJ_ASSERT_NONNULL(maybeDb, "database not open");
+
+  // Create the RegisteredAggregateUdf structure to hold the callbacks
+  auto udf = kj::heap<RegisteredAggregateUdf>();
+  // Store the name in lowercase for case-insensitive lookup in the authorizer.
+  // SQLite function names are case-insensitive.
+  udf->name = toLowercase(name);
+  udf->stepCallback = kj::mv(stepCallback);
+  udf->finalCallback = kj::mv(finalCallback);
+  udf->db = this;
+
+  // Register with SQLite using the original name (SQLite handles case-insensitivity internally)
+  int rc = sqlite3_create_function_v2(sqliteDb, name.cStr(), argCount, SQLITE_UTF8,
+      udf.get(),               // user_data
+      nullptr,                 // xFunc (for scalar functions)
+      aggregateStepCallback,   // xStep
+      aggregateFinalCallback,  // xFinal
+      nullptr                  // xDestroy (we manage lifetime ourselves)
+  );
+
+  KJ_REQUIRE(rc == SQLITE_OK, "Failed to register aggregate UDF", name, sqlite3_errmsg(sqliteDb));
+
+  // Store the UDF so it stays alive.
+  // We need to erase any existing entry first because the HashMap key is a StringPtr
+  // pointing to the RegisteredAggregateUdf's name field. If we just upsert, the old key
+  // pointer would become dangling when the old value is destroyed.
+  registeredAggregateUdfs.erase(udf->name.asPtr());
+  registeredAggregateUdfs.insert(udf->name.asPtr(), kj::mv(udf));
+}
 
 }  // namespace workerd

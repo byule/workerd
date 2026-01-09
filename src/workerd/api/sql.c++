@@ -8,6 +8,8 @@
 
 #include <workerd/io/io-context.h>
 
+#include <cmath>
+
 namespace workerd::api {
 
 // Maximum total size of all cached statements (measured in size of the SQL code). If cached
@@ -77,11 +79,26 @@ jsg::Ref<SqlStorage::Cursor> SqlStorage::exec(
     // In theory we could try to cache multiple copies of the statement, but as this is probably
     // exceedingly rare, it is not worth the added code complexity.
     SqliteDatabase::Regulator& regulator = *this;
-    return js.alloc<Cursor>(
-        js, kj::mv(doneCallback), db, regulator, js.toString(querySql), kj::mv(bindings));
+    try {
+      return js.alloc<Cursor>(
+          js, kj::mv(doneCallback), db, regulator, js.toString(querySql), kj::mv(bindings));
+    } catch (kj::Exception& e) {
+      // Rethrow with trusted=true and allowNonObjects=true to preserve the original
+      // thrown value from UDF exceptions, matching native JS semantics.
+      // trusted=true preserves stack traces, allowNonObjects=true allows non-Error
+      // values (strings, numbers, objects) to pass through unchanged.
+      js.throwException(kj::mv(e), {.trusted = true, .allowNonObjects = true});
+    }
   }
 
-  auto result = js.alloc<Cursor>(js, kj::mv(doneCallback), slot.addRef(), kj::mv(bindings));
+  auto result = [&]() {
+    try {
+      return js.alloc<Cursor>(js, kj::mv(doneCallback), slot.addRef(), kj::mv(bindings));
+    } catch (kj::Exception& e) {
+      // Rethrow with trusted=true and allowNonObjects=true to match native JS semantics.
+      js.throwException(kj::mv(e), {.trusted = true, .allowNonObjects = true});
+    }
+  }();
 
   // If the statement cache grew too big, drop the least-recently-used entry.
   while (statementCache.totalSize > SQL_STATEMENT_CACHE_MAX_SIZE) {
@@ -136,6 +153,404 @@ double SqlStorage::getDatabaseSize(jsg::Lock& js) {
   auto dbSize = pages * getPageSize(db);
   userSpan.setTag("cloudflare.durable_object.response.db_size"_kjc, static_cast<int64_t>(dbSize));
   return dbSize;
+}
+
+// Helper function to convert SQLite args to a JS array
+static v8::Local<v8::Array> sqliteArgsToJsArray(
+    jsg::Lock& js, kj::ArrayPtr<const SqliteDatabase::UdfArgValue> args) {
+  auto array = v8::Array::New(js.v8Isolate, args.size());
+  for (size_t i = 0; i < args.size(); i++) {
+    v8::Local<v8::Value> jsVal;
+    KJ_SWITCH_ONEOF(args[i]) {
+      KJ_CASE_ONEOF(intVal, int64_t) {
+        jsVal = v8::Number::New(js.v8Isolate, static_cast<double>(intVal));
+      }
+      KJ_CASE_ONEOF(doubleVal, double) {
+        jsVal = v8::Number::New(js.v8Isolate, doubleVal);
+      }
+      KJ_CASE_ONEOF(strVal, kj::StringPtr) {
+        jsVal = jsg::v8Str(js.v8Isolate, strVal);
+      }
+      KJ_CASE_ONEOF(blobVal, kj::ArrayPtr<const kj::byte>) {
+        auto copy = kj::heapArray<kj::byte>(blobVal.size());
+        memcpy(copy.begin(), blobVal.begin(), blobVal.size());
+        jsVal = js.wrapBytes(kj::mv(copy));
+      }
+      KJ_CASE_ONEOF(nullVal, decltype(nullptr)) {
+        jsVal = v8::Null(js.v8Isolate);
+      }
+    }
+    jsg::check(array->Set(js.v8Context(), i, jsVal));
+  }
+  return array;
+}
+
+// Helper function to convert JS result back to SQLite UdfResultValue
+static SqliteDatabase::UdfResultValue jsResultToSqlite(jsg::Lock& js, v8::Local<v8::Value> handle) {
+  if (handle->IsNull() || handle->IsUndefined()) {
+    return nullptr;
+  } else if (handle->IsNumber()) {
+    double num = handle.As<v8::Number>()->Value();
+    double intPart;
+    if (std::modf(num, &intPart) == 0.0 &&
+        num >= static_cast<double>(static_cast<int64_t>(kj::minValue)) &&
+        num <= static_cast<double>(static_cast<int64_t>(kj::maxValue))) {
+      return static_cast<int64_t>(num);
+    }
+    return num;
+  } else if (handle->IsString()) {
+    return kj::str(js.toString(jsg::JsValue(handle)));
+  } else if (handle->IsArrayBuffer() || handle->IsArrayBufferView()) {
+    jsg::BufferSource buffer(js, handle);
+    auto data = buffer.asArrayPtr();
+    auto copy = kj::heapArray<kj::byte>(data.size());
+    memcpy(copy.begin(), data.begin(), data.size());
+    return kj::mv(copy);
+  } else if (handle->IsPromise()) {
+    // Async functions return Promises, which is almost certainly a mistake.
+    // Throw a clear error instead of silently stringifying to "[object Promise]".
+    JSG_FAIL_REQUIRE(TypeError,
+        "UDF returned a Promise. UDFs must be synchronous - async functions are not supported. "
+        "If you need async data, fetch it before the query and pass it as a parameter.");
+  } else {
+    // For other types (objects, arrays, booleans, dates, etc.), stringify them.
+    // This allows useful cases like returning Date objects (which stringify to a date string)
+    // or arrays (which stringify to comma-separated values), or objects with custom toString().
+    auto str = kj::str(js.toString(jsg::JsValue(handle)));
+
+    // Reject plain objects that stringify to "[object Object]" - this is never useful
+    // and almost certainly a mistake. Users should use JSON.stringify() if they want JSON.
+    if (str == "[object Object]") {
+      JSG_FAIL_REQUIRE(TypeError,
+          "UDF returned a plain object, which would stringify to \"[object Object]\". "
+          "If you want to return JSON, use JSON.stringify(). "
+          "If you want a custom string, add a toString() method to your object.");
+    }
+
+    return kj::mv(str);
+  }
+}
+
+// Helper to call a JS function with exception handling
+static v8::Local<v8::Value> callJsFunction(jsg::Lock& js,
+    v8::Local<v8::Function> func,
+    v8::Local<v8::Value> recv,
+    int argc,
+    v8::Local<v8::Value>* argv) {
+  v8::TryCatch tryCatch(js.v8Isolate);
+  auto maybeResult = func->Call(js.v8Context(), recv, argc, argv);
+  if (tryCatch.HasCaught()) {
+    jsg::throwTunneledException(js.v8Isolate, tryCatch.Exception());
+  }
+  return maybeResult.ToLocalChecked();
+}
+
+void SqlStorage::createScalarFunction(
+    jsg::Lock& js, kj::String name, jsg::JsRef<jsg::JsValue> callback) {
+  auto jsFunc = kj::heap<RegisteredScalarFunction>(kj::str(name), kj::mv(callback));
+  auto* jsFuncPtr = jsFunc.get();
+  // Erase any existing entry first, then insert. We can't use upsert because the HashMap
+  // key is a StringPtr pointing to the value's name field - upsert would keep the old key
+  // pointer which becomes dangling when the old value is destroyed.
+  registeredScalarFunctions.erase(jsFuncPtr->name.asPtr());
+  registeredScalarFunctions.insert(jsFuncPtr->name.asPtr(), kj::mv(jsFunc));
+
+  auto& db = getDb(js);
+  // The lambda captures jsFuncPtr (a raw pointer) by value. This is safe because:
+  // 1. The RegisteredScalarFunction is owned by registeredScalarFunctions HashMap
+  // 2. The HashMap entry lives as long as this SqlStorage object
+  // 3. If the function is replaced, SQLite atomically replaces the callback, so the old
+  //    lambda (with its now-invalid pointer) will never be called
+  db.registerScalarFunction(jsFuncPtr->name.asPtr(), -1,  // -1 = variadic
+      [jsFuncPtr](
+          kj::ArrayPtr<const SqliteDatabase::UdfArgValue> args) -> SqliteDatabase::UdfResultValue {
+    auto& workerLock = IoContext::current().getCurrentLock();
+    jsg::Lock& js = workerLock;
+
+    auto jsArgsArray = sqliteArgsToJsArray(js, args);
+
+    // Get the callback function
+    v8::Local<v8::Value> funcHandle = jsFuncPtr->callback.getHandle(js);
+    JSG_REQUIRE(funcHandle->IsFunction(), TypeError, "UDF callback must be a function");
+    auto func = funcHandle.As<v8::Function>();
+
+    // Convert array to individual args
+    auto argc = jsArgsArray->Length();
+    auto argv = kj::heapArray<v8::Local<v8::Value>>(argc);
+    for (uint32_t i = 0; i < argc; i++) {
+      argv[i] = jsg::check(jsArgsArray->Get(js.v8Context(), i));
+    }
+
+    auto resultVal = callJsFunction(js, func, v8::Undefined(js.v8Isolate), argc, argv.begin());
+
+    return jsResultToSqlite(js, resultVal);
+  });
+}
+
+void SqlStorage::createAggregateFunction(
+    jsg::Lock& js, kj::String name, jsg::JsRef<jsg::JsValue> factory) {
+  auto jsFunc = kj::heap<RegisteredAggregateFunction>(kj::str(name), kj::mv(factory));
+  auto* jsFuncPtr = jsFunc.get();
+  // Erase any existing entry first, then insert. We can't use upsert because the HashMap
+  // key is a StringPtr pointing to the value's name field - upsert would keep the old key
+  // pointer which becomes dangling when the old value is destroyed.
+  registeredAggregateFunctions.erase(jsFuncPtr->name.asPtr());
+  registeredAggregateFunctions.insert(jsFuncPtr->name.asPtr(), kj::mv(jsFunc));
+
+  auto& db = getDb(js);
+
+  // The lambdas capture jsFuncPtr (a raw pointer) by value. This is safe because:
+  // 1. The RegisteredAggregateFunction is owned by registeredAggregateFunctions HashMap
+  // 2. The HashMap entry lives as long as this SqlStorage object
+  // 3. If the function is replaced, SQLite atomically replaces the callbacks, so the old
+  //    lambdas (with their now-invalid pointers) will never be called
+
+  // Step callback - factory pattern
+  // The state holds a v8::Global<v8::Object> pointing to the {step, final} instance.
+  // On first call, we invoke the factory to create the instance.
+  auto stepCb =
+      [jsFuncPtr](kj::Maybe<SqliteDatabase::UdfResultValue&> state,
+          kj::ArrayPtr<const SqliteDatabase::UdfArgValue> args) -> SqliteDatabase::UdfResultValue {
+    auto& workerLock = IoContext::current().getCurrentLock();
+    jsg::Lock& js = workerLock;
+
+    v8::Local<v8::Object> instance;
+
+    KJ_IF_SOME(s, state) {
+      // State exists - it's a string that we use as a key. But actually, for the factory
+      // pattern we need to store the JS object differently. We'll store it in a side table.
+      // For now, use a simpler approach: the state holds a serialized marker, and we
+      // retrieve the actual instance from a persistent handle stored elsewhere.
+      //
+      // Actually, let's use a different approach: store the instance handle directly
+      // in the UdfResultValue as a string containing a pointer (hacky but works).
+      // Better approach: use the state to store a pointer to a persistent handle.
+      KJ_SWITCH_ONEOF(s) {
+        KJ_CASE_ONEOF(intVal, int64_t) {
+          // The int64 is actually a pointer to a v8::Global<v8::Object>
+          auto* globalPtr =
+              reinterpret_cast<v8::Global<v8::Object>*>(static_cast<uintptr_t>(intVal));
+          instance = globalPtr->Get(js.v8Isolate);
+        }
+        KJ_CASE_ONEOF_DEFAULT {
+          JSG_FAIL_REQUIRE(Error, "Invalid aggregate state");
+        }
+      }
+    } else {
+      // First call - invoke the factory to create the instance
+      v8::Local<v8::Value> factoryHandle = jsFuncPtr->factory.getHandle(js);
+      JSG_REQUIRE(factoryHandle->IsFunction(), TypeError, "Aggregate factory must be a function");
+      auto factoryFunc = factoryHandle.As<v8::Function>();
+
+      auto resultVal = callJsFunction(js, factoryFunc, v8::Undefined(js.v8Isolate), 0, nullptr);
+
+      JSG_REQUIRE(resultVal->IsObject(), TypeError,
+          "Aggregate factory must return an object with step and final methods");
+      instance = resultVal.As<v8::Object>();
+
+      // Verify step and final exist
+      auto stepKey = jsg::v8StrIntern(js.v8Isolate, "step"_kj);
+      auto finalKey = jsg::v8StrIntern(js.v8Isolate, "final"_kj);
+      auto stepVal = jsg::check(instance->Get(js.v8Context(), stepKey));
+      auto finalVal = jsg::check(instance->Get(js.v8Context(), finalKey));
+      JSG_REQUIRE(stepVal->IsFunction(), TypeError,
+          "Aggregate factory must return an object with a 'step' function");
+      JSG_REQUIRE(finalVal->IsFunction(), TypeError,
+          "Aggregate factory must return an object with a 'final' function");
+    }
+
+    // Get the step function from the instance
+    auto stepKey = jsg::v8StrIntern(js.v8Isolate, "step"_kj);
+    auto stepVal = jsg::check(instance->Get(js.v8Context(), stepKey));
+    auto stepFunc = stepVal.As<v8::Function>();
+
+    // Convert SQL args to JS args
+    auto jsArgsArray = sqliteArgsToJsArray(js, args);
+    auto argc = jsArgsArray->Length();
+    auto argv = kj::heapArray<v8::Local<v8::Value>>(argc);
+    for (uint32_t i = 0; i < argc; i++) {
+      argv[i] = jsg::check(jsArgsArray->Get(js.v8Context(), i));
+    }
+
+    // Call step method on the instance
+    auto stepResult = callJsFunction(js, stepFunc, instance, argc, argv.begin());
+
+    // Check if step returned a Promise (async function mistake)
+    if (stepResult->IsPromise()) {
+      JSG_FAIL_REQUIRE(TypeError,
+          "Aggregate step function returned a Promise. UDFs must be synchronous - "
+          "async functions are not supported.");
+    }
+
+    // If this was the first call, we need to return a state value that encodes
+    // a pointer to a persistent handle for the instance.
+    KJ_IF_SOME(s, state) {
+      // State already exists, return the same pointer
+      KJ_SWITCH_ONEOF(s) {
+        KJ_CASE_ONEOF(intVal, int64_t) {
+          return intVal;
+        }
+        KJ_CASE_ONEOF_DEFAULT {
+          KJ_UNREACHABLE;
+        }
+      }
+      KJ_UNREACHABLE;
+    } else {
+      // Create a persistent handle and return a pointer to it as int64
+      // Note: This leaks memory! We need to clean it up in the final callback.
+      auto* globalPtr = new v8::Global<v8::Object>(js.v8Isolate, instance);
+      return static_cast<int64_t>(reinterpret_cast<uintptr_t>(globalPtr));
+    }
+  };
+
+  // Final callback - factory pattern
+  auto finalCb =
+      [jsFuncPtr](
+          kj::Maybe<SqliteDatabase::UdfResultValue&> state) -> SqliteDatabase::UdfResultValue {
+    auto& workerLock = IoContext::current().getCurrentLock();
+    jsg::Lock& js = workerLock;
+
+    v8::Global<v8::Object>* globalPtr = nullptr;
+    v8::Local<v8::Object> instance;
+
+    KJ_IF_SOME(s, state) {
+      KJ_SWITCH_ONEOF(s) {
+        KJ_CASE_ONEOF(intVal, int64_t) {
+          globalPtr = reinterpret_cast<v8::Global<v8::Object>*>(static_cast<uintptr_t>(intVal));
+          instance = globalPtr->Get(js.v8Isolate);
+        }
+        KJ_CASE_ONEOF_DEFAULT {
+          JSG_FAIL_REQUIRE(Error, "Invalid aggregate state");
+        }
+      }
+    } else {
+      // No state means no rows were processed. Call factory to get an instance
+      // so we can call final() on it.
+      v8::Local<v8::Value> factoryHandle = jsFuncPtr->factory.getHandle(js);
+      JSG_REQUIRE(factoryHandle->IsFunction(), TypeError, "Aggregate factory must be a function");
+      auto factoryFunc = factoryHandle.As<v8::Function>();
+
+      auto resultVal = callJsFunction(js, factoryFunc, v8::Undefined(js.v8Isolate), 0, nullptr);
+
+      JSG_REQUIRE(resultVal->IsObject(), TypeError,
+          "Aggregate factory must return an object with step and final methods");
+      instance = resultVal.As<v8::Object>();
+    }
+
+    // Get the final function from the instance
+    auto finalKey = jsg::v8StrIntern(js.v8Isolate, "final"_kj);
+    auto finalVal = jsg::check(instance->Get(js.v8Context(), finalKey));
+    JSG_REQUIRE(
+        finalVal->IsFunction(), TypeError, "Aggregate instance must have a 'final' function");
+    auto finalFunc = finalVal.As<v8::Function>();
+
+    // Call final method on the instance
+    auto resultVal = callJsFunction(js, finalFunc, instance, 0, nullptr);
+
+    // Clean up the persistent handle
+    if (globalPtr != nullptr) {
+      delete globalPtr;
+    }
+
+    return jsResultToSqlite(js, resultVal);
+  };
+
+  db.registerAggregateFunction(jsFuncPtr->name.asPtr(), -1, kj::mv(stepCb), kj::mv(finalCb));
+}
+
+void SqlStorage::newFunction(jsg::Lock& js, kj::String name, jsg::JsValue callback) {
+  // Validate function name
+  JSG_REQUIRE(name.size() > 0, TypeError, "Function name cannot be empty.");
+  JSG_REQUIRE(name.size() <= 255, TypeError, "Function name is too long (max 255 bytes).");
+
+  // JsValue implicitly converts to v8::Local<v8::Value>
+  v8::Local<v8::Value> handle = callback;
+
+  JSG_REQUIRE(handle->IsFunction(), TypeError, "newFunction expects a function callback.");
+
+  // Register as scalar function
+  createScalarFunction(js, kj::mv(name), jsg::JsRef<jsg::JsValue>(js, callback));
+}
+
+void SqlStorage::newAggregate(jsg::Lock& js, kj::String name, jsg::JsValue callback) {
+  // Validate function name
+  JSG_REQUIRE(name.size() > 0, TypeError, "Function name cannot be empty.");
+  JSG_REQUIRE(name.size() <= 255, TypeError, "Function name is too long (max 255 bytes).");
+
+  // JsValue implicitly converts to v8::Local<v8::Value>
+  v8::Local<v8::Value> handle = callback;
+
+  JSG_REQUIRE(handle->IsFunction(), TypeError, "newAggregate expects a function callback.");
+
+  auto func = handle.As<v8::Function>();
+
+  // Auto-detect based on function.length:
+  // - 0 parameters: factory pattern (returns {step, final})
+  // - 1+ parameters: array-based (receives array of all values)
+  auto lengthKey = jsg::v8StrIntern(js.v8Isolate, "length"_kj);
+  auto lengthVal = jsg::check(func->Get(js.v8Context(), lengthKey));
+  int funcLength =
+      lengthVal->IsNumber() ? static_cast<int>(lengthVal.As<v8::Number>()->Value()) : 0;
+
+  if (funcLength == 0) {
+    // Factory pattern: function returns {step, final}
+    // Validate by calling it once to check the return value
+    v8::TryCatch tryCatch(js.v8Isolate);
+    auto maybeResult = func->Call(js.v8Context(), v8::Undefined(js.v8Isolate), 0, nullptr);
+
+    JSG_REQUIRE(!tryCatch.HasCaught() && !maybeResult.IsEmpty(), TypeError,
+        "Aggregate factory function threw an error when called.");
+
+    auto result = maybeResult.ToLocalChecked();
+    JSG_REQUIRE(result->IsObject(), TypeError,
+        "Aggregate factory must return an object with step and final methods.");
+
+    auto obj = result.As<v8::Object>();
+    auto stepKey = jsg::v8StrIntern(js.v8Isolate, "step"_kj);
+    auto finalKey = jsg::v8StrIntern(js.v8Isolate, "final"_kj);
+    auto stepVal = jsg::check(obj->Get(js.v8Context(), stepKey));
+    auto finalVal = jsg::check(obj->Get(js.v8Context(), finalKey));
+
+    JSG_REQUIRE(stepVal->IsFunction() && finalVal->IsFunction(), TypeError,
+        "Aggregate factory must return an object with step and final methods.");
+
+    // Register as aggregate with factory pattern
+    createAggregateFunction(js, kj::mv(name), jsg::JsRef<jsg::JsValue>(js, callback));
+  } else {
+    // Array-based pattern: wrap the callback in a factory that buffers values
+    // This is implemented in JavaScript for simplicity
+    auto factoryCode = jsg::v8StrIntern(js.v8Isolate,
+        "(function(callback) {"
+        "  return function() {"
+        "    const values = [];"
+        "    return {"
+        "      step: function(...args) {"
+        "        if (args.length === 1) {"
+        "          values.push(args[0]);"
+        "        } else {"
+        "          values.push(args);"
+        "        }"
+        "      },"
+        "      final: function() {"
+        "        return callback(values);"
+        "      }"
+        "    };"
+        "  };"
+        "})"_kj);
+
+    // Compile and run the factory code
+    v8::Local<v8::Script> script = jsg::check(v8::Script::Compile(js.v8Context(), factoryCode));
+    v8::Local<v8::Value> factoryMaker = jsg::check(script->Run(js.v8Context()));
+
+    JSG_REQUIRE(factoryMaker->IsFunction(), Error, "Internal error creating aggregate wrapper");
+    auto factoryMakerFunc = factoryMaker.As<v8::Function>();
+    v8::Local<v8::Value> args[] = {handle};
+    v8::Local<v8::Value> factory =
+        jsg::check(factoryMakerFunc->Call(js.v8Context(), v8::Undefined(js.v8Isolate), 1, args));
+
+    // Register the wrapped factory
+    createAggregateFunction(js, kj::mv(name), jsg::JsRef<jsg::JsValue>(js, jsg::JsValue(factory)));
+  }
 }
 
 bool SqlStorage::isAllowedName(kj::StringPtr name) const {
@@ -383,7 +798,13 @@ kj::Maybe<v8::LocalVector<v8::Value>> SqlStorage::Cursor::iteratorImpl(
   // Unfortunately, this does not help with the case where the application stops iterating with
   // results still available from the cursor. There's not much we can do about that case since
   // there's no way to know if the app might come back and try to use the cursor again later.
-  query.nextRow();
+  try {
+    query.nextRow();
+  } catch (kj::Exception& e) {
+    // Rethrow with trusted=true and allowNonObjects=true to preserve the original
+    // thrown value from UDF exceptions, matching native JS semantics.
+    js.throwException(kj::mv(e), {.trusted = true, .allowNonObjects = true});
+  }
   if (query.isDone()) {
     obj->endQuery(state);
   }

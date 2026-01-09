@@ -37,6 +37,39 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
 
   double getDatabaseSize(jsg::Lock& js);
 
+  // Register a user-defined scalar SQL function.
+  //
+  // Example:
+  //   sql.newFunction('double', (x) => x * 2);
+  //   sql.newFunction('greet', (name) => `Hello, ${name}!`);
+  //
+  // The callback is invoked once per row, receiving the column values as arguments
+  // and returning a single value.
+  void newFunction(jsg::Lock& js, kj::String name, jsg::JsValue callback);
+
+  // Register a user-defined aggregate SQL function.
+  //
+  // Two forms are supported, auto-detected based on the callback signature:
+  //
+  // 1. Array-based (ergonomic, O(n) memory) - callback takes 1+ arguments:
+  //   sql.newAggregate('my_max', (values) => Math.max(...values));
+  //   sql.newAggregate('my_sum', (values) => values.reduce((a, b) => a + b, 0));
+  //   sql.newAggregate('weighted', (rows) => rows.reduce((s, [v, w]) => s + v * w, 0));
+  //
+  // 2. Factory pattern (efficient, O(1) memory) - callback takes 0 arguments:
+  //   sql.newAggregate('my_sum', () => {
+  //     let sum = 0;
+  //     return {
+  //       step: (value) => { sum += value; },
+  //       final: () => sum
+  //     };
+  //   });
+  //
+  // The factory pattern is preferred for large datasets since it doesn't buffer
+  // all values in memory. The factory is called once per aggregation group, and
+  // state lives in the closure.
+  void newAggregate(jsg::Lock& js, kj::String name, jsg::JsValue callback);
+
   JSG_RESOURCE_TYPE(SqlStorage, CompatibilityFlags::Reader flags) {
     JSG_METHOD(exec);
 
@@ -49,6 +82,10 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
       JSG_METHOD(ingest);
 
       JSG_METHOD(setMaxPageCountForTest);
+
+      // User-defined functions are experimental
+      JSG_METHOD(newFunction);
+      JSG_METHOD(newAggregate);
     }
 
     JSG_READONLY_PROTOTYPE_PROPERTY(databaseSize, getDatabaseSize);
@@ -57,7 +94,13 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
     JSG_NESTED_TYPE(Statement);
 
     JSG_TS_OVERRIDE({
-      exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: any[]): SqlStorageCursor<T>
+      exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: any[]): SqlStorageCursor<T>;
+      newFunction(name: string, callback: (...args: SqlStorageValue[]) => SqlStorageValue): void;
+      newAggregate(name: string, callback: (values: SqlStorageValue[]) => SqlStorageValue): void;
+      newAggregate(name: string, factory: () => {
+        step: (...args: SqlStorageValue[]) => void;
+        final: () => SqlStorageValue;
+      }): void;
     });
   }
 
@@ -66,7 +109,17 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
  private:
   void visitForGc(jsg::GcVisitor& visitor) {
     visitor.visit(storage);
+    for (auto& entry: registeredScalarFunctions) {
+      visitor.visit(entry.value->callback);
+    }
+    for (auto& entry: registeredAggregateFunctions) {
+      visitor.visit(entry.value->factory);
+    }
   }
+
+  // Helper methods for createFunction - implemented in sql.c++
+  void createScalarFunction(jsg::Lock& js, kj::String name, jsg::JsRef<jsg::JsValue> callback);
+  void createAggregateFunction(jsg::Lock& js, kj::String name, jsg::JsRef<jsg::JsValue> factory);
 
   bool isAllowedName(kj::StringPtr name) const override;
   bool isAllowedTrigger(kj::StringPtr name) const override;
@@ -83,6 +136,28 @@ class SqlStorage final: public jsg::Object, private SqliteDatabase::Regulator {
   kj::Maybe<uint> pageSize;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaPageCount;
   kj::Maybe<IoOwn<SqliteDatabase::Statement>> pragmaGetMaxPageCount;
+
+  // Storage for user-defined scalar functions.
+  struct RegisteredScalarFunction {
+    kj::String name;
+    jsg::JsRef<jsg::JsValue> callback;
+
+    RegisteredScalarFunction(kj::String name, jsg::JsRef<jsg::JsValue> callback)
+        : name(kj::mv(name)),
+          callback(kj::mv(callback)) {}
+  };
+  kj::HashMap<kj::StringPtr, kj::Own<RegisteredScalarFunction>> registeredScalarFunctions;
+
+  // Storage for user-defined aggregate functions (factory pattern).
+  struct RegisteredAggregateFunction {
+    kj::String name;
+    jsg::JsRef<jsg::JsValue> factory;  // Factory function that returns {step, final}
+
+    RegisteredAggregateFunction(kj::String name, jsg::JsRef<jsg::JsValue> factory)
+        : name(kj::mv(name)),
+          factory(kj::mv(factory)) {}
+  };
+  kj::HashMap<kj::StringPtr, kj::Own<RegisteredAggregateFunction>> registeredAggregateFunctions;
 
   // A statement in the statement cache.
   struct CachedStatement: public kj::Refcounted {
