@@ -8,7 +8,7 @@
 #include <workerd/api/unsafe.h>
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
-#include <workerd/io/supported-compatibility-date.embed.h>
+#include <workerd/io/release-version.embed.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/rust/cxx-integration/lib.rs.h>
 #include <workerd/server/cpp-capnp-schema.embed.h>
@@ -105,7 +105,7 @@ namespace workerd::server {
 namespace {
 
 static kj::StringPtr getVersionString() {
-  static const kj::String result = kj::str("workerd ", SUPPORTED_COMPATIBILITY_DATE);
+  static const kj::String result = kj::str("workerd ", RELEASE_VERSION);
   return result;
 }
 
@@ -685,6 +685,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         argv(argv),
         server(kj::heap<Server>(*fs,
             io.provider->getTimer(),
+            kj::systemPreciseMonotonicClock(),
             network,
             entropySource,
             Worker::LoggingOptions(Worker::ConsoleMode::STDOUT),

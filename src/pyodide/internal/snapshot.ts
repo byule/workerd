@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
 import { enterJaegerSpan } from 'pyodide-internal:jaeger';
 import { default as ArtifactBundler } from 'pyodide-internal:artifacts';
 import { default as UnsafeEval } from 'internal:unsafe-eval';
@@ -31,6 +35,7 @@ import {
   maybeSerializeJsModule,
   type SerializedJsModule,
 } from 'pyodide-internal:serializeJsModule';
+import { PyodideVersion } from 'pyodide-internal:const';
 
 // A handle is the pointer into the linear memory returned by dlopen. Multiple dlopens will return
 // multiple pointers.
@@ -231,7 +236,7 @@ function getMemoryPatched(
   libPath: string,
   size: number
 ): number {
-  if (Module.API.version === '0.26.0a2') {
+  if (Module.API.version === PyodideVersion.V0_26_0a2) {
     return Module.getMemory(size);
   }
   // Sometimes the module is loaded once by path and once by name, in either order. I'm not really
@@ -385,7 +390,7 @@ function preloadDynamicLibsMain(Module: Module, loadOrder: string[]): void {
 }
 
 function preloadDynamicLibs(Module: Module): void {
-  if (Module.API.version === '0.26.0a2') {
+  if (Module.API.version === PyodideVersion.V0_26_0a2) {
     // In 0.26.0a2 we need to preload dynamic libraries even if we aren't restoring a snapshot.
     preloadDynamicLibs026(Module);
     return;
@@ -640,7 +645,7 @@ function makeLinearMemorySnapshot(
   const dsoHandles = recordDsoHandles(Module);
   let hiwire: SnapshotConfig | undefined;
   const jsModuleNames: Set<string> = new Set();
-  if (Module.API.version !== '0.26.0a2') {
+  if (Module.API.version !== PyodideVersion.V0_26_0a2) {
     hiwire = Module.API.serializeHiwireState(
       getHiwireSerializer(customSerializedObjects, jsModuleNames)
     );
@@ -863,7 +868,7 @@ export function maybeCollectDedicatedSnapshot(
     return;
   }
 
-  if (Module.API.version == '0.26.0a2') {
+  if (Module.API.version == PyodideVersion.V0_26_0a2) {
     // 0.26.0a2 does not support serialisation of the hiwire state, so it cannot support dedicated
     // snapshots.
     throw new PythonWorkersInternalError(
@@ -915,7 +920,7 @@ export function finalizeBootstrap(
   customSerializedObjects: CustomSerializedObjects
 ): void {
   Module.API.config._makeSnapshot =
-    IS_CREATING_SNAPSHOT && Module.API.version !== '0.26.0a2';
+    IS_CREATING_SNAPSHOT && Module.API.version !== PyodideVersion.V0_26_0a2;
   enterJaegerSpan('finalize_bootstrap', () => {
     Module.API.finalizeBootstrap(
       LOADED_SNAPSHOT_META?.hiwire,

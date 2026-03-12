@@ -133,6 +133,19 @@ class IsolateBase {
     return kj::none;
   }
 
+  // Requests an extra microtask checkpoint after the current one completes.
+  inline void requestExtraMicrotaskCheckpoint(kj::Badge<Lock>) {
+    extraMicrotaskCheckpointRequested = true;
+  }
+
+  // Returns true if an extra microtask checkpoint was requested since the last
+  // call, and clears the flag.
+  inline bool takeExtraMicrotaskCheckpointRequested(kj::Badge<Lock>) {
+    bool requested = extraMicrotaskCheckpointRequested;
+    extraMicrotaskCheckpointRequested = false;
+    return requested;
+  }
+
   inline void setAllowEval(kj::Badge<Lock>, bool allow) {
     if (alwaysAllowEval) return;
     evalAllowed = allow;
@@ -155,6 +168,10 @@ class IsolateBase {
     nodeJsProcessV2Enabled = enabled;
   }
 
+  inline void setRequireReturnsDefaultExportEnabled(kj::Badge<Lock>, bool enabled) {
+    requireReturnsDefaultExportEnabled = enabled;
+  }
+
   inline bool areWarningsLogged() const {
     return maybeLogger != kj::none;
   }
@@ -168,6 +185,10 @@ class IsolateBase {
 
   inline bool isNodeJsProcessV2Enabled() const {
     return nodeJsProcessV2Enabled;
+  }
+
+  inline bool isRequireReturnsDefaultExportEnabled() const {
+    return requireReturnsDefaultExportEnabled;
   }
 
   inline bool shouldSetToStringTag() const {
@@ -184,6 +205,14 @@ class IsolateBase {
 
   void enableSetImmutablePrototype() {
     shouldSetImmutablePrototypeFlag = true;
+  }
+
+  inline bool shouldUseSpecCompliantPropertyAttributes() const {
+    return specCompliantPropertyAttributesFlag;
+  }
+
+  void enableSpecCompliantPropertyAttributes() {
+    specCompliantPropertyAttributesFlag = true;
   }
 
   inline void disableTopLevelAwait() {
@@ -339,12 +368,15 @@ class IsolateBase {
   bool asyncContextTrackingEnabled = false;
   bool nodeJsCompatEnabled = false;
   bool nodeJsProcessV2Enabled = false;
+  bool requireReturnsDefaultExportEnabled = false;
   bool setToStringTag = false;
   bool shouldSetImmutablePrototypeFlag = false;
+  bool specCompliantPropertyAttributesFlag = false;
   bool allowTopLevelAwait = true;
   bool usingNewModuleRegistry = false;
   bool usingEnhancedErrorSerialization = false;
   bool usingFastJsgStruct = false;
+  bool extraMicrotaskCheckpointRequested = false;
 
   // Only used when the original module registry is used.
   bool throwOnUnrecognizedImportAssertion = false;

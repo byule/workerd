@@ -821,3 +821,46 @@ export let noMixedJsPythonModules2 = {
     });
   },
 };
+
+// Test that startup exceptions show proper error messages, not internal errors.
+export let startupException = {
+  async test(ctrl, env, ctx) {
+    let worker = env.loader.get('startupException', () => {
+      return {
+        compatibilityDate: '2025-01-01',
+        mainModule: 'main.js',
+        modules: {
+          'main.js': `
+            import {WorkerEntrypoint} from "cloudflare:workers";
+
+            // This will throw during startup (global scope)
+            throw new Error('intentional startup error');
+
+            export default class extends WorkerEntrypoint {
+              greet(name) {
+                return "Hello, " + name;
+              }
+            }
+          `,
+        },
+      };
+    });
+
+    let ep = worker.getEntrypoint();
+    try {
+      await ep.greet('Alice');
+      assert.fail('Expected exception to be thrown');
+    } catch (error) {
+      assert(
+        error.message.includes('intentional startup error'),
+        `Expected error message to contain 'intentional startup error', but got: ${error.message}`
+      );
+
+      // The error should NOT be a generic internal error
+      assert(
+        !error.message.includes('internal error; reference'),
+        `Error should not be a generic internal error, got: ${error.message}`
+      );
+    }
+  },
+};

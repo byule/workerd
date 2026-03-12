@@ -60,7 +60,7 @@ jobs:
           # due to resource constraints, exclude the macOS and x64 Linux debug runners for now.
           # linux-asan and arm64 linux-debug should provide sufficient coverage for building in the
           # debug configuration.
-          - os: { name: macOS, arch: ARM64 ,image: macos-15-xlarge }
+          - os: { name: macOS, arch: ARM64, image: macos-15-xlarge }
             config: { suffix: -debug }
           - os: { name: linux, arch: X64, image: ubuntu-22.04-16core }
             config: { suffix: -debug }
@@ -89,7 +89,7 @@ jobs:
       os_name: linux
       arch_name: 'X64'
       suffix: ''
-      extra_bazel_args: '--config=ci-test --config=ci-linux'
+      extra_bazel_args: '--config=ci-test --config=ci-linux --config=wpt-report'
       upload_test_logs: true
       upload_binary: true
       build_container_images: true
@@ -100,7 +100,7 @@ jobs:
   lint:
     uses: ./.github/workflows/_bazel.yml
     with:
-      extra_bazel_args: '--config=lint --config=clang-tidy --config=ci-test --config=ci-linux'
+      extra_bazel_args: '--config=lint --config=clang-tidy --config=ci-test --config=ci-linux-common'
       run_tests: false
       parse_headers: true
     secrets:
@@ -183,7 +183,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           # Match workers-sdk node version
-          node-version: 20.19.1
+          node-version: 20.19.6
           cache: 'pnpm'
       - name: Install workers-sdk dependencies
         run: pnpm install

@@ -6,12 +6,12 @@
   },
   {
     "directory": "src",
-    "globs": ["*.js", "*.ts", "*.cjs", "*.ejs", "*.mjs"],
+    "globs": ["*.js", "*.ts", "*.cjs", "*.ejs", "*.mjs", "*.json"],
     "formatter": "prettier"
   },
   {
-    "directory": "src",
-    "globs": ["*.json"],
+    "directory": "fuzzilli",
+    "globs": ["*.js"],
     "formatter": "prettier"
   },
   {

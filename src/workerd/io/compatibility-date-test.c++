@@ -4,7 +4,7 @@
 
 #include "compatibility-date.h"
 
-#include <workerd/io/supported-compatibility-date.embed.h>
+#include <workerd/io/maximum-compatibility-date.embed.h>
 
 #include <capnp/message.h>
 #include <capnp/serialize-text.h>
@@ -149,7 +149,10 @@ KJ_TEST("compatibility flag parsing") {
   expectCompileCompatibilityFlags("2252-04-01", {}, "()",
       {kj::str("This Worker requires compatibility date \"2252-04-01\", but the newest date "
                "supported by this server binary is \"",
-          SUPPORTED_COMPATIBILITY_DATE, "\".")},
+           MAXIMUM_COMPATIBILITY_DATE, "\"."),
+        kj::str("Can't set compatibility date in the future: \"2252-04-01\". Today's date "
+                "(UTC) is \"",
+            currentDateStr(), "\".")},
       CompatibilityDateValidation::CODE_VERSION);
 
   // Test experimental requirement using durable_object_rename as it is obsolete

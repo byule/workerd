@@ -6,7 +6,8 @@
 
 #include "time.h"
 
-#include <workerd/io/supported-compatibility-date.embed.h>
+#include <workerd/io/maximum-compatibility-date.embed.h>
+#include <workerd/io/release-version.embed.h>
 
 #include <capnp/dynamic.h>
 #include <capnp/schema.h>
@@ -108,12 +109,20 @@ static void compileCompatibilityFlags(kj::StringPtr compatDate,
 
   switch (dateValidation) {
     case CompatibilityDateValidation::CODE_VERSION:
-      if (KJ_ASSERT_NONNULL(CompatDate::parse(SUPPORTED_COMPATIBILITY_DATE)) < parsedCompatDate) {
+      if (KJ_ASSERT_NONNULL(CompatDate::parse(MAXIMUM_COMPATIBILITY_DATE)) < parsedCompatDate) {
         errorReporter.addError(
             kj::str("This Worker requires compatibility date \"", parsedCompatDate,
                 "\", but the newest "
                 "date supported by this server binary is \"",
-                SUPPORTED_COMPATIBILITY_DATE, "\"."));
+                MAXIMUM_COMPATIBILITY_DATE, "\"."));
+      }
+      // workerd is built with MAXIMUM_COMPATIBILITY_DATE set a little bit into the future, so
+      // that the build can support setting the compat date to today until the next release is
+      // ready. But we don't want people to actually set their compat date in the future, so let's
+      // check against the clock time as well.
+      if (CompatDate::today() < parsedCompatDate) {
+        errorReporter.addError(kj::str("Can't set compatibility date in the future: \"",
+            parsedCompatDate, "\". Today's date (UTC) is \"", CompatDate::today(), "\"."));
       }
       break;
 

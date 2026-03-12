@@ -156,10 +156,6 @@ static kj::String escapeJsonString(kj::StringPtr text) {
   return kj::str("\"", escaped.releaseAsArray(), "\"");
 }
 
-// TODO(now): Temporary
-class ServerResolveObserver final: public jsg::ResolveObserver {};
-const ServerResolveObserver serverResolveObserver;
-
 template <typename T>
 static inline kj::Own<T> fakeOwn(T& ref) {
   return kj::Own<T>(&ref, kj::NullDisposer::instance);
@@ -179,12 +175,14 @@ void throwDynamicEntrypointTransferError() {
 
 Server::Server(kj::Filesystem& fs,
     kj::Timer& timer,
+    const kj::MonotonicClock& monotonicClock,
     kj::Network& network,
     kj::EntropySource& entropySource,
     Worker::LoggingOptions loggingOptions,
     kj::Function<void(kj::String)> reportConfigError)
     : fs(fs),
       timer(timer),
+      monotonicClock(monotonicClock),
       network(network),
       entropySource(entropySource),
       reportConfigError(kj::mv(reportConfigError)),
@@ -1791,6 +1789,13 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   bool hasExcessivelyExceededHeapLimit() const override {
     return false;
   }
+
+  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
+    return trackedWasmInstances;
+  }
+
+ private:
+  TrackedWasmInstanceList trackedWasmInstances;
 };
 
 }  // namespace
@@ -1890,6 +1895,7 @@ class Server::WorkerService final: public Service,
   WorkerService(ChannelTokenHandler& channelTokenHandler,
       kj::Maybe<kj::StringPtr> serviceName,
       ThreadContext& threadContext,
+      const kj::MonotonicClock& monotonicClock,
       kj::Own<const Worker> worker,
       kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers,
       kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints,
@@ -1897,10 +1903,12 @@ class Server::WorkerService final: public Service,
       LinkCallback linkCallback,
       AbortActorsCallback abortActorsCallback,
       kj::Maybe<kj::String> dockerPathParam,
+      kj::Maybe<kj::String> containerEgressInterceptorImageParam,
       bool isDynamic)
       : channelTokenHandler(channelTokenHandler),
         serviceName(serviceName),
         threadContext(threadContext),
+        monotonicClock(monotonicClock),
         ioChannels(kj::mv(linkCallback)),
         worker(kj::mv(worker)),
         defaultEntrypointHandlers(kj::mv(defaultEntrypointHandlers)),
@@ -1909,6 +1917,7 @@ class Server::WorkerService final: public Service,
         waitUntilTasks(*this),
         abortActorsCallback(kj::mv(abortActorsCallback)),
         dockerPath(kj::mv(dockerPathParam)),
+        containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic) {}
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
@@ -1929,9 +1938,9 @@ class Server::WorkerService final: public Service,
       }
 
       auto actorClass = kj::refcounted<ActorClassImpl>(*this, entry.key, Frankenvalue());
-      auto ns =
-          kj::heap<ActorNamespace>(kj::mv(actorClass), entry.value, threadContext.getUnsafeTimer(),
-              threadContext.getByteStreamFactory(), network, dockerPath, waitUntilTasks);
+      auto ns = kj::heap<ActorNamespace>(kj::mv(actorClass), entry.value,
+          threadContext.getUnsafeTimer(), threadContext.getByteStreamFactory(), channelTokenHandler,
+          network, dockerPath, containerEgressInterceptorImage, waitUntilTasks);
       actorNamespaces.insert(entry.key, kj::mv(ns));
     }
   }
@@ -2179,14 +2188,16 @@ class Server::WorkerService final: public Service,
     kj::Own<RequestObserver> observer =
         kj::refcounted<RequestObserverWithTracer>(mapAddRef(workerTracer), waitUntilTasks);
 
-    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName,
-        kj::mv(props), kj::mv(actor), kj::Own<LimitEnforcer>(this, kj::NullDisposer::instance),
-        {},  // ioContextDependency
+    return newWorkerEntrypoint(
+        threadContext, kj::atomicAddRef(*worker), entrypointName, kj::mv(props), kj::mv(actor),
+        kj::Own<LimitEnforcer>(this, kj::NullDisposer::instance), {},  // ioContextDependency
         kj::Own<IoChannelFactory>(this, kj::NullDisposer::instance), kj::mv(observer),
         waitUntilTasks,
         true,                  // tunnelExceptions
         kj::mv(workerTracer),  // workerTracer
-        kj::mv(metadata.cfBlobJson));
+        kj::mv(metadata.cfBlobJson),
+        kj::none  // versionInfo
+    );
   }
 
   class ActorNamespace final {
@@ -2195,15 +2206,19 @@ class Server::WorkerService final: public Service,
         const ActorConfig& config,
         kj::Timer& timer,
         capnp::ByteStreamFactory& byteStreamFactory,
+        ChannelTokenHandler& channelTokenHandler,
         kj::Network& dockerNetwork,
         kj::Maybe<kj::StringPtr> dockerPath,
+        kj::Maybe<kj::StringPtr> containerEgressInterceptorImage,
         kj::TaskSet& waitUntilTasks)
         : actorClass(kj::mv(actorClass)),
           config(config),
           timer(timer),
           byteStreamFactory(byteStreamFactory),
+          channelTokenHandler(channelTokenHandler),
           dockerNetwork(dockerNetwork),
           dockerPath(dockerPath),
+          containerEgressInterceptorImage(containerEgressInterceptorImage),
           waitUntilTasks(waitUntilTasks) {}
 
     // Called at link time to provide needed resources.
@@ -2313,6 +2328,11 @@ class Server::WorkerService final: public Service,
           auto reason = 0;
           a->shutdown(reason);
         }
+
+        // Drop the container client reference
+        // If setInactivityTimeout() was called, there's still a timer holding a reference
+        // If not, this may be the last reference and the ContainerClient destructor will run
+        containerClient = kj::none;
       }
 
       void active() override {
@@ -2441,6 +2461,7 @@ class Server::WorkerService final: public Service,
         manager = kj::none;
         tracker->shutdown();
         actor = kj::none;
+        containerClient = kj::none;
 
         KJ_IF_SOME(r, reason) {
           brokenReason = kj::cp(r);
@@ -2511,6 +2532,9 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Promise<void>> shutdownTask;
       kj::Maybe<kj::Promise<void>> onBrokenTask;
       kj::Maybe<kj::Exception> brokenReason;
+
+      // Reference to the ContainerClient (if container is enabled for this actor)
+      kj::Maybe<kj::Own<ContainerClient>> containerClient;
 
       // If this is a `ForkedPromise<void>`, await the promise. When it has resolved, then
       // `classAndId` will have been replaced with the resolved `ClassAndId` value.
@@ -2683,6 +2707,11 @@ class Server::WorkerService final: public Service,
         }
         // Destroy the last strong Worker::Actor reference.
         actor = kj::none;
+
+        // Drop our reference to the ContainerClient
+        // If setInactivityTimeout() was called, the timer still holds a reference
+        // so the container stays alive until the timeout expires
+        containerClient = kj::none;
       }
 
       void start(kj::Own<ActorClass>& actorClass, Worker::Actor::Id& id) {
@@ -2732,7 +2761,7 @@ class Server::WorkerService final: public Service,
               });
 
               return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
-                  []() -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
+                  [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
                   .attach(kj::mv(sqliteHooks));
             } else {
               // Create an ActorCache backed by a fake, empty storage. Elsewhere, we configure
@@ -2767,10 +2796,8 @@ class Server::WorkerService final: public Service,
 
         auto loopback = kj::refcounted<Loopback>(*this);
 
-        kj::Maybe<rpc::Container::Client> containerClient = kj::none;
+        kj::Maybe<rpc::Container::Client> container = kj::none;
         KJ_IF_SOME(config, containerOptions) {
-          auto& dockerPathRef = KJ_ASSERT_NONNULL(ns.dockerPath,
-              "dockerPath needs to be defined in order enable containers on this durable object.");
           KJ_ASSERT(config.hasImageName(), "Image name is required");
           auto imageName = config.getImageName();
           kj::String containerId;
@@ -2782,15 +2809,14 @@ class Server::WorkerService final: public Service,
               containerId = kj::str(existingId);
             }
           }
-          containerClient = kj::heap<ContainerClient>(ns.byteStreamFactory, timer, ns.dockerNetwork,
-              kj::str(dockerPathRef),
-              kj::str("workerd-", KJ_ASSERT_NONNULL(uniqueKey), "-", containerId),
-              kj::str(imageName), ns.waitUntilTasks);
+
+          container = ns.getContainerClient(
+              kj::str("workerd-", KJ_ASSERT_NONNULL(uniqueKey), "-", containerId), imageName);
         }
 
         auto actor = actorClass->newActor(getTracker(), Worker::Actor::cloneId(id),
             kj::mv(makeActorCache), kj::mv(makeStorage), kj::mv(loopback), tryGetManagerRef(),
-            kj::mv(containerClient), *this);
+            kj::mv(container), *this);
         onBrokenTask = monitorOnBroken(*actor);
         this->actor = kj::mv(actor);
       }
@@ -2828,6 +2854,73 @@ class Server::WorkerService final: public Service,
       })->addRef();
     }
 
+    kj::Own<ContainerClient> getContainerClient(
+        kj::StringPtr containerId, kj::StringPtr imageName) {
+      KJ_IF_SOME(existingClient, containerClients.find(containerId)) {
+        return existingClient->addRef();
+      }
+
+      // No existing container in the map, create a new one
+      auto& dockerPathRef = KJ_ASSERT_NONNULL(
+          dockerPath, "dockerPath must be defined to enable containers on this Durable Object.");
+
+      // Grab a branch of any pending cleanup from a previous ContainerClient for this
+      // container. If it exists, pass it to the container client so it knows that it has to sync.
+      kj::Promise<void> previousCleanup = kj::READY_NOW;
+      KJ_IF_SOME(state, containerCleanupState.find(containerId)) {
+        previousCleanup = state.promise.addBranch();
+      }
+
+      // Upsert the cleanup state for this container ID. Replacing the
+      // canceler auto-cancels any in-flight cleanup tasks from the previous
+      // client's destructor. The generation counter is bumped on replacement
+      // so the cleanup callback can detect stale ownership without relying
+      // on raw pointer identity (which is vulnerable to address reuse).
+      auto canceler = kj::heap<kj::Canceler>();
+      uint64_t capturedGeneration = 0;
+      containerCleanupState.upsert(kj::str(containerId),
+          ContainerCleanupState{.canceler = kj::mv(canceler)},
+          [&capturedGeneration](ContainerCleanupState& existing, ContainerCleanupState&& incoming) {
+        existing.canceler = kj::mv(incoming.canceler);
+        capturedGeneration = ++existing.generation;
+      });
+
+      // Cleanup callback: invoked from the ContainerClient destructor with the joined
+      // with a cleanup promise
+      kj::Function<void(kj::Promise<void>)> cleanupCallback =
+          [this, containerId = kj::str(containerId), capturedGeneration](
+              kj::Promise<void> cleanupPromise) mutable {
+        KJ_IF_SOME(state, containerCleanupState.find(containerId)) {
+          if (state.generation != capturedGeneration) {
+            // A newer ContainerClient has replaced us already with another destructor.
+            // drop the promise.
+            return;
+          }
+
+          containerClients.erase(containerId);
+          // Wrap with the canceler so a future client creation can cancel these
+          // tasks
+          auto cancellable =
+              state.canceler->wrap(kj::mv(cleanupPromise)).catch_([](kj::Exception&&) {});
+
+          auto forked = kj::mv(cancellable).fork();
+          waitUntilTasks.add(forked.addBranch());
+          state.promise = kj::mv(forked);
+        }
+      };
+
+      auto client = kj::refcounted<ContainerClient>(byteStreamFactory, timer, dockerNetwork,
+          kj::str(dockerPathRef), kj::str(containerId), kj::str(imageName),
+          kj::str(KJ_ASSERT_NONNULL(containerEgressInterceptorImage,
+              "containerEgressInterceptorImage must be configured for containers.")),
+          waitUntilTasks, kj::mv(previousCleanup), kj::mv(cleanupCallback), channelTokenHandler);
+
+      // Store raw pointer in map (does not own)
+      containerClients.insert(kj::str(containerId), client.get());
+
+      return kj::mv(client);
+    }
+
     void abortAll(kj::Maybe<const kj::Exception&> reason) {
       for (auto& actor: actors) {
         actor.value->abort(reason);
@@ -2852,15 +2945,45 @@ class Server::WorkerService final: public Service,
     //   declare `actorStorage` before `actors`.
     kj::Maybe<ActorStorage> actorStorage;
 
+    // Tracks the canceler and cleanup promise for a Docker container's lifecycle cleanup.
+    // Useful to await on async calls of a ContainerClient destructor when the new
+    // one appears before they've been resolved.
+    struct ContainerCleanupState {
+      // Canceler that wraps the promise fired in ~ContainerClient. Replacing
+      // it cancels any pending cleanup, which resolves the promise immediately.
+      kj::Own<kj::Canceler> canceler;
+
+      // Forked cleanup promise. A branch is added to waitUntilTasks to keep the I/O alive,
+      // and another branch is passed to the next ContainerClient so its status() can await.
+      kj::ForkedPromise<void> promise = kj::Promise<void>(kj::READY_NOW).fork();
+
+      // Monotonically increasing counter, bumped each time the canceler is replaced
+      // via upsert. The cleanup callback captures the generation at creation time and
+      // compares it to detect whether a newer ContainerClient has taken ownership,
+      // avoiding a raw-pointer identity check that is vulnerable to address reuse.
+      uint64_t generation = 0;
+    };
+
+    // Per-container cleanup state: canceler + forked cleanup promise.
+    kj::HashMap<kj::String, ContainerCleanupState> containerCleanupState;
+
+    // Map of container IDs to ContainerClients (for reconnection support with inactivity timeouts).
+    // The map holds raw pointers (not ownership) - ContainerClients are owned by actors and timers.
+    // When the last reference is dropped, the destructor removes the entry from this map.
+    kj::HashMap<kj::String, ContainerClient*> containerClients;
+
     // If the actor is broken, we remove it from the map. However, if it's just evicted due to
     // inactivity, we keep the ActorContainer in the map but drop the Own<Worker::Actor>. When a new
     // request comes in, we recreate the Own<Worker::Actor>.
     ActorMap actors;
+
     kj::Maybe<kj::Promise<void>> cleanupTask;
     kj::Timer& timer;
     capnp::ByteStreamFactory& byteStreamFactory;
+    ChannelTokenHandler& channelTokenHandler;
     kj::Network& dockerNetwork;
     kj::Maybe<kj::StringPtr> dockerPath;
+    kj::Maybe<kj::StringPtr> containerEgressInterceptorImage;
     kj::TaskSet& waitUntilTasks;
     kj::Maybe<AlarmScheduler&> alarmScheduler;
 
@@ -3086,6 +3209,7 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::StringPtr> serviceName;
 
   ThreadContext& threadContext;
+  const kj::MonotonicClock& monotonicClock;
 
   // LinkedIoChannels owns the SqliteDatabase::Vfs, so make sure it is destroyed last.
   kj::OneOf<LinkCallback, LinkedIoChannels> ioChannels;
@@ -3098,6 +3222,7 @@ class Server::WorkerService final: public Service,
   kj::TaskSet waitUntilTasks;
   AbortActorsCallback abortActorsCallback;
   kj::Maybe<kj::String> dockerPath;
+  kj::Maybe<kj::String> containerEgressInterceptorImage;
   bool isDynamic;
 
   class ActorChannelImpl final: public IoChannelFactory::ActorChannel {
@@ -3168,8 +3293,7 @@ class Server::WorkerService final: public Service,
         kj::Maybe<kj::String> cacheName,
         kj::Maybe<kj::String> cfBlobJson,
         SpanParent parentSpan)
-        : client(asHttpClient(parent.startRequest(
-              {kj::mv(cfBlobJson), TraceParentContext(kj::mv(parentSpan), nullptr)}))),
+        : client(asHttpClient(parent.startRequest({kj::mv(cfBlobJson), kj::mv(parentSpan)}))),
           cacheName(kj::mv(cacheName)),
           cacheNamespaceHeader(cacheNamespaceHeader) {}
 
@@ -3239,8 +3363,9 @@ class Server::WorkerService final: public Service,
     co_return;
   }
 
-  kj::Own<SubrequestChannel> getSubrequestChannel(
-      uint channel, kj::Maybe<Frankenvalue> props) override {
+  kj::Own<SubrequestChannel> getSubrequestChannel(uint channel,
+      kj::Maybe<Frankenvalue> props,
+      kj::Maybe<VersionRequest> versionRequest) override {
     auto& channels =
         KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(), "link() has not been called");
 
@@ -3264,7 +3389,8 @@ class Server::WorkerService final: public Service,
       ActorGetMode mode,
       bool enableReplicaRouting,
       ActorRoutingMode routingMode,
-      SpanParent parentSpan) override {
+      SpanParent parentSpan,
+      kj::Maybe<ActorVersion> version) override {
     JSG_REQUIRE(mode == ActorGetMode::GET_OR_CREATE, Error,
         "workerd only supports GET_OR_CREATE mode for getting actor stubs");
     JSG_REQUIRE(!enableReplicaRouting, Error, "workerd does not support replica routing.");
@@ -3339,12 +3465,20 @@ class Server::WorkerService final: public Service,
     // Nothing to do
   }
 
-  kj::Date now() override {
+  kj::Date now(kj::Maybe<kj::Date>) override {
     return kj::systemPreciseCalendarClock().now();
   }
 
   kj::Promise<void> atTime(kj::Date when) override {
-    return threadContext.getUnsafeTimer().afterDelay(when - now());
+    auto delay = when - now(kj::none);
+    // We can't use `afterDelay(delay)` here because kj::Timer::afterDelay() is equivalent to
+    // `atTime(timer.now() + delay)`, and kj::Timer::now() only advances when the event loop
+    // polls for I/O. If JavaScript executed for a significant amount of time since the last
+    // poll (e.g. compiling/running a script before the first setTimeout), timer.now() will be
+    // stale and the delay will effectively be shortened by that staleness, causing the timer
+    // to fire too early. Instead, we compute the target time using a fresh reading from the
+    // monotonic clock so the delay is measured from the actual present.
+    return threadContext.getUnsafeTimer().atTime(monotonicClock.now() + delay);
   }
 
   kj::Promise<void> afterLimitTimeout(kj::Duration t) override {
@@ -3834,6 +3968,13 @@ void Server::abortAllActors(kj::Maybe<const kj::Exception&> reason) {
       }
     }
   }
+
+  // When using vitest-pool-workers and DOs have alarms, alarms can still attempt to run after the tests
+  // end running that leads to internal reference errors.
+  // On more complex setups with multiple DOs that have alarms and all of them communicate with one another,
+  // there might be cases where there are isolated storage errors when calling DOs wake one another.
+  // Deleting all of them at the same time guarantees that user's implementations don't affect tests runs
+  alarmScheduler->deleteAllAlarms();
 }
 
 // WorkerDef is an intermediate representation of everything from `config::Worker::Reader` that
@@ -4382,20 +4523,22 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       // to load certain modules from a fallback service. This is generally intended for local
       // dev/testing purposes only.
       auto& apiIsolate = isolate->getApi();
+      auto fallbackClient =
+          kj::heap<workerd::fallback::FallbackServiceClient>(kj::str(moduleFallback));
       apiIsolate.setModuleFallbackCallback(
-          [address = kj::str(moduleFallback), featureFlags = apiIsolate.getFeatureFlags()](
+          [client = kj::mv(fallbackClient), featureFlags = apiIsolate.getFeatureFlags()](
               jsg::Lock& js, kj::StringPtr specifier, kj::Maybe<kj::String> referrer,
               jsg::CompilationObserver& observer, jsg::ModuleRegistry::ResolveMethod method,
               kj::Maybe<kj::StringPtr> rawSpecifier) mutable
           -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
         kj::HashMap<kj::StringPtr, kj::StringPtr> attributes;
         KJ_IF_SOME(moduleOrRedirect,
-            workerd::fallback::tryResolve(workerd::fallback::Version::V1,
+            client->tryResolve(workerd::fallback::Version::V1,
                 method == jsg::ModuleRegistry::ResolveMethod::IMPORT
                     ? workerd::fallback::ImportType::IMPORT
                     : workerd::fallback::ImportType::REQUIRE,
-                address, specifier, rawSpecifier.orDefault(nullptr),
-                referrer.orDefault(kj::String()), attributes)) {
+                specifier, rawSpecifier.orDefault(nullptr), referrer.orDefault(kj::String()),
+                attributes)) {
           KJ_SWITCH_ONEOF(moduleOrRedirect) {
             KJ_CASE_ONEOF(redirect, kj::String) {
               // If a string is returned, then the fallback service returned a 301 redirect.
@@ -4439,8 +4582,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     return def.compileBindings(lock, api, target);
   };
   auto worker = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
-      kj::mv(compileBindings), IsolateObserver::StartType::COLD,
-      TraceParentContext(nullptr, nullptr),  // systemTracer -- TODO(beta): factor out
+      kj::mv(compileBindings), IsolateObserver::StartType::COLD, SpanParent(nullptr),
       Worker::Lock::TakeSynchronously(kj::none), errorReporter);
 
   uint totalActorChannels = 0;
@@ -4672,23 +4814,30 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   };
 
   kj::Maybe<kj::String> dockerPath = kj::none;
+  kj::Maybe<kj::String> containerEgressInterceptorImage = kj::none;
   switch (def.containerEngineConf.which()) {
     case config::Worker::ContainerEngine::NONE:
       // No container engine configured
       break;
-    case config::Worker::ContainerEngine::LOCAL_DOCKER:
-      dockerPath = kj::str(def.containerEngineConf.getLocalDocker().getSocketPath());
+    case config::Worker::ContainerEngine::LOCAL_DOCKER: {
+      auto dockerConf = def.containerEngineConf.getLocalDocker();
+      dockerPath = kj::str(dockerConf.getSocketPath());
+      if (dockerConf.hasContainerEgressInterceptorImage()) {
+        containerEgressInterceptorImage = kj::str(dockerConf.getContainerEgressInterceptorImage());
+      }
       break;
+    }
   }
 
   kj::Maybe<kj::StringPtr> serviceName;
   if (!def.isDynamic) serviceName = name;
 
-  auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
-      globalContext->threadContext, kj::mv(worker), kj::mv(errorReporter.defaultEntrypoint),
-      kj::mv(errorReporter.namedEntrypoints), kj::mv(errorReporter.actorClasses),
-      kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors), kj::mv(dockerPath),
-      def.isDynamic);
+  auto result =
+      kj::refcounted<WorkerService>(channelTokenHandler, serviceName, globalContext->threadContext,
+          monotonicClock, kj::mv(worker), kj::mv(errorReporter.defaultEntrypoint),
+          kj::mv(errorReporter.namedEntrypoints), kj::mv(errorReporter.actorClasses),
+          kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors), kj::mv(dockerPath),
+          kj::mv(containerEgressInterceptorImage), def.isDynamic);
   result->initActorNamespaces(def.localActorConfigs, network);
   co_return result;
 }
@@ -4880,14 +5029,17 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
         httpOverCapnpFactory(httpOverCapnpFactory) {}
 
   kj::Promise<void> startEvent(StartEventContext context) override {
-    // TODO(someday): Use cfBlobJson from the connection if there is one, or from RPC params
-    //   if we add that? (Note that if a connection-level cf blob exists, it should take
-    //   priority; we should only accept a cf blob from the client if we have a cfBlobHeader
-    //   configured, which hints that this service trusts the client to provide the cf blob.)
-
+    // Extract the optional cf blob from the RPC params and pass it along with the
+    // service channel to EventDispatcherImpl. The cf blob will be included in
+    // SubrequestMetadata when creating the WorkerInterface for HTTP events.
+    kj::Maybe<kj::String> cfBlobJson;
+    auto params = context.getParams();
+    if (params.hasCfBlobJson()) {
+      cfBlobJson = kj::str(params.getCfBlobJson());
+    }
     context.initResults(capnp::MessageSize{4, 1})
-        .setDispatcher(
-            kj::heap<EventDispatcherImpl>(httpOverCapnpFactory, service->startRequest({})));
+        .setDispatcher(kj::heap<EventDispatcherImpl>(
+            httpOverCapnpFactory, kj::addRef(*service), kj::mv(cfBlobJson)));
     return kj::READY_NOW;
   }
 
@@ -4897,14 +5049,22 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
 
   class EventDispatcherImpl final: public rpc::EventDispatcher::Server {
    public:
-    EventDispatcherImpl(
-        capnp::HttpOverCapnpFactory& httpOverCapnpFactory, kj::Own<WorkerInterface> worker)
+    EventDispatcherImpl(capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
+        kj::Own<IoChannelFactory::SubrequestChannel> service,
+        kj::Maybe<kj::String> cfBlobJson)
         : httpOverCapnpFactory(httpOverCapnpFactory),
-          worker(kj::mv(worker)) {}
+          service(kj::mv(service)),
+          cfBlobJson(kj::mv(cfBlobJson)) {}
 
     kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+      // Create WorkerInterface with cf blob metadata (if provided via startEvent).
+      IoChannelFactory::SubrequestMetadata metadata;
+      KJ_IF_SOME(cf, cfBlobJson) {
+        metadata.cfBlobJson = kj::str(cf);
+      }
+      auto worker = getService()->startRequest(kj::mv(metadata));
       context.initResults(capnp::MessageSize{4, 1})
-          .setHttp(httpOverCapnpFactory.kjToCapnp(getWorker()));
+          .setHttp(httpOverCapnpFactory.kjToCapnp(kj::mv(worker)));
       return kj::READY_NOW;
     }
 
@@ -4964,13 +5124,20 @@ class Server::WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
 
    private:
     capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
-    kj::Maybe<kj::Own<WorkerInterface>> worker;
+    kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> service;
+    kj::Maybe<kj::String> cfBlobJson;
+
+    kj::Own<IoChannelFactory::SubrequestChannel> getService() {
+      auto result =
+          kj::mv(KJ_ASSERT_NONNULL(service, "EventDispatcher can only be used for one request"));
+      service = kj::none;
+      return result;
+    }
 
     kj::Own<WorkerInterface> getWorker() {
-      auto result =
-          kj::mv(KJ_ASSERT_NONNULL(worker, "EventDispatcher can only be used for one request"));
-      worker = kj::none;
-      return result;
+      // For non-HTTP events (RPC, traces, etc.), create WorkerInterface with
+      // empty metadata since there's no HTTP request to extract cf from.
+      return getService()->startRequest({});
     }
 
     [[noreturn]] void throwUnsupported() {
@@ -5839,7 +6006,7 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
     //   stderr wouldn't work.
     KJ_LOG(DBG, kj::str("[ TEST ] "_kj, name));
     auto req = service.startRequest({});
-    auto start = kj::systemPreciseMonotonicClock().now();
+    auto start = monotonicClock.now();
 
     bool result = co_await req->test();
     if (result) {
@@ -5848,7 +6015,7 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
       ++failCount;
     }
 
-    auto end = kj::systemPreciseMonotonicClock().now();
+    auto end = monotonicClock.now();
     auto duration = end - start;
 
     KJ_LOG(DBG, kj::str(result ? "[ PASS ] "_kj : "[ FAIL ] "_kj, name, " (", duration, ")"));

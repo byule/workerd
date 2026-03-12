@@ -1634,7 +1634,7 @@ struct RemovePromise_<Promise<T>> {
   using Type = T;
 };
 template <typename T>
-using RemovePromise = typename RemovePromise_<T>::Type;
+using RemovePromise = RemovePromise_<T>::Type;
 
 // Convenience template to add `jsg::Promise` if it is not present.
 template <typename T>
@@ -1646,7 +1646,7 @@ struct MaintainPromise_<Promise<T>> {
   using Type = Promise<T>;
 };
 template <typename T>
-using MaintainPromise = typename MaintainPromise_<T>::Type;
+using MaintainPromise = MaintainPromise_<T>::Type;
 
 // Convenience template to calculate the return type of a function when passed parameter type T.
 // `T = void` is understood to mean no parameters.
@@ -1669,7 +1669,7 @@ struct ReturnType_<Func, void, true> {
   using Type = decltype(kj::instance<Func>()(kj::instance<Lock&>()));
 };
 template <typename Func, typename T, bool passLock = false>
-using ReturnType = typename ReturnType_<Func, T, passLock>::Type;
+using ReturnType = ReturnType_<Func, T, passLock>::Type;
 
 // Convenience template to produce a promise for the result of calling a function with the given
 // parameter type. This wraps the function's result type in `jsg::Promise` UNLESS the function
@@ -2647,10 +2647,12 @@ class Lock {
 
   void setNodeJsCompatEnabled();
   void setNodeJsProcessV2Enabled();
+  void setRequireReturnsDefaultExportEnabled();
   void setThrowOnUnrecognizedImportAssertion();
   bool getThrowOnUnrecognizedImportAssertion() const;
   void setToStringTag();
   void setImmutablePrototype();
+  void setSpecCompliantPropertyAttributes();
   void disableTopLevelAwait();
 
   using Logger = void(Lock&, kj::StringPtr);
@@ -2757,6 +2759,14 @@ class Lock {
 
   // Utility method to safely allocate a v8::BackingStore with allocation failure handling.
   // Throws a javascript error if allocation fails.
+  //
+  // IMPORTANT: This method can trigger garbage collection, which may move or invalidate V8
+  // objects. Do NOT call this method while:
+  // - A v8::String::ValueView is alive (it holds internal V8 heap locks)
+  // - You have raw pointers to V8 heap data (e.g., from view.data8(), view.data16())
+  //
+  // Safe pattern: Copy V8 string data to off-heap memory FIRST (e.g., via JsString::writeInto()
+  // into kj::SmallArray), THEN call allocBackingStore(). See TextEncoder::encode() for example.
   std::unique_ptr<v8::BackingStore> allocBackingStore(
       size_t size, AllocOption init_mode = AllocOption::ZERO_INITIALIZED) KJ_WARN_UNUSED_RESULT;
 
@@ -2798,6 +2808,9 @@ class Lock {
 #undef V
 
   void runMicrotasks();
+
+  // Request an extra microtask checkpoint after the current one completes.
+  void requestExtraMicrotaskCheckpoint();
 
   // Sets the terminate-execution flag on the isolate so that the next time code tries to run, it
   // will be terminated. (But note that V8 only checks the flag at certain times, so it's possible
@@ -2994,6 +3007,101 @@ inline v8::Local<v8::Context> JsContext<T>::getHandle(Lock& js) const {
 inline Value SelfRef::asValue(Lock& js) const {
   return Value(js.v8Isolate, getHandle(js).As<v8::Value>());
 }
+
+namespace _ {
+
+// Helper class for JSG_TRY / JSG_CATCH macros.
+//
+// Sets up a v8::TryCatch on construction and converts caught exceptions to jsg::Value.
+// Handles both JsExceptionThrown (returns V8 exception directly) and kj::Exception
+// (converts via Lock::exceptionToJs()).
+//
+// This class is an implementation detail of the JSG_TRY / JSG_CATCH macros and should
+// not be used directly.
+class JsgCatchScope {
+ public:
+  explicit JsgCatchScope(Lock& js);
+
+  // Converts the in-flight exception to a jsg::Value and stores it.
+  // Called by JSG_CATCH macro.
+  void catchException(ExceptionToJsOptions options = {});
+
+  // Returns the caught exception. Must be called after catchException().
+  Value& getCaughtException() {
+    return KJ_ASSERT_NONNULL(caughtException);
+  }
+
+ private:
+  Lock& js;
+
+  // Simple wrapper to work around v8::TryCatch's deleted operator new.
+  struct Holder {
+    v8::TryCatch tryCatch;
+    explicit Holder(v8::Isolate* isolate): tryCatch(isolate) {}
+  };
+
+  // We use two separate Maybe members rather than kj::OneOf<Holder, Value> because v8::TryCatch
+  // has deleted copy/move constructors, making it incompatible with OneOf's internal storage.
+  // The tryCatchHolder is active during the try block and released by catchException(), which
+  // then populates caughtException.
+
+  // Active during the try block, consumed by catchException().
+  kj::Maybe<Holder> tryCatchHolder;
+
+  // Populated by catchException(), returned by getCaughtException().
+  kj::Maybe<Value> caughtException;
+};
+
+}  // namespace _
+
+// JSG_TRY / JSG_CATCH macros for exception handling in JSG code.
+//
+// These macros provide clean exception handling that automatically converts both JavaScript
+// exceptions (JsExceptionThrown) and KJ exceptions (kj::Exception) to jsg::Value. This is
+// the recommended way to handle exceptions in JSG code.
+//
+// Usage:
+//   JSG_TRY(js) {
+//     someCodeThatMightThrow();
+//   } JSG_CATCH(exception) {
+//     // `exception` is a jsg::Value& containing the caught exception
+//     return js.rejectedPromise<void>(kj::mv(exception));
+//   }
+//
+// With ExceptionToJsOptions:
+//   JSG_TRY(js) {
+//     someCodeThatMightThrow();
+//   } JSG_CATCH(exception, {.ignoreDetail = true}) {
+//     // Handle exception with custom conversion options
+//   }
+//
+// JSG_TRY(js): Sets up exception handling with the given jsg::Lock. The `js` parameter makes
+// the isolate explicit and enables future coroutine support.
+//
+// JSG_CATCH(name, ...): Catches any exception and converts it to a jsg::Value. The `name`
+// parameter is a user-chosen identifier that will be a `jsg::Value&` in the handler block.
+// Optional ExceptionToJsOptions can be passed as a second argument.
+//
+// IMPORTANT: The code block following JSG_CATCH is NOT a true catch handler:
+// - You CANNOT rethrow with `throw` (there is no current exception)
+//
+// To rethrow the exception, use: js.throwException(kj::mv(exception));
+
+// Since we have two macros -- JSG_TRY and JSG_CATCH -- which must both access the same state,
+// we use a hard-coded variable name. This causes benign shadowing in nested JSG_TRY/JSG_CATCHes,
+// so we disable shadowing warnings. The `_jsg` prefix makes name collision unlikely.
+#define JSG_TRY(js)                                                                                \
+  KJ_SILENCE_SHADOWING_BEGIN                                                                       \
+  if (::workerd::jsg::_::JsgCatchScope _jsgTryCatch(js); true) try KJ_SILENCE_SHADOWING_END
+
+#define JSG_CATCH(exception, ...)                                                                  \
+  catch (...) {                                                                                    \
+    _jsgTryCatch.catchException(__VA_ARGS__);                                                      \
+    goto KJ_UNIQUE_NAME(_jsgTryCatchHandler);                                                      \
+  }                                                                                                \
+  else KJ_UNIQUE_NAME(_jsgTryCatchHandler)                                                         \
+      : if (auto& exception = _jsgTryCatch.getCaughtException(); false) {}                         \
+  else
 
 }  // namespace workerd::jsg
 

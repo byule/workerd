@@ -9,6 +9,7 @@
 #include <kj/filesystem.h>
 #include <kj/function.h>
 #include <kj/list.h>
+#include <kj/map.h>
 #include <kj/one-of.h>
 #include <kj/string.h>
 
@@ -17,6 +18,8 @@
 struct sqlite3;
 struct sqlite3_vfs;
 struct sqlite3_stmt;
+struct sqlite3_context;
+struct sqlite3_value;
 
 KJ_DECLARE_NON_POLYMORPHIC(sqlite3_stmt);
 
@@ -310,7 +313,73 @@ class SqliteDatabase {
     }
   }
 
+  // ==========================================================================
+  // User-Defined Functions (UDFs)
+  // ==========================================================================
+
+  // Value type for UDF results. This type owns its data.
+  // For arguments, we use a non-owning variant (UdfArgValue) since SQLite manages the memory.
+  using UdfResultValue = kj::OneOf<kj::Array<byte>, kj::String, int64_t, double, decltype(nullptr)>;
+
+  // Value type for UDF arguments (non-owning, points to SQLite-managed memory).
+  using UdfArgValue =
+      kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double, decltype(nullptr)>;
+
+  // Signature for a scalar UDF callback.
+  // Takes an array of argument values and returns a result value.
+  // To report an error, throw a kj::Exception.
+  using ScalarUdfCallback = kj::Function<UdfResultValue(kj::ArrayPtr<const UdfArgValue> args)>;
+
+  // Signature for aggregate UDF step callback.
+  // Takes current state (may be null on first call) and argument values.
+  // Returns new state value.
+  using AggregateStepCallback = kj::Function<UdfResultValue(
+      kj::Maybe<UdfResultValue&> state, kj::ArrayPtr<const UdfArgValue> args)>;
+
+  // Signature for aggregate UDF final callback.
+  // Takes final state (may be null if no rows) and returns the aggregate result.
+  using AggregateFinalCallback = kj::Function<UdfResultValue(kj::Maybe<UdfResultValue&> state)>;
+
+  // Register a user-defined scalar function with SQLite.
+  //
+  // `name` - The SQL function name. Must not conflict with built-in functions.
+  // `argCount` - Number of arguments, or -1 for variadic functions.
+  // `callback` - Function to call when the UDF is invoked.
+  //
+  // The callback is invoked synchronously during SQL query execution.
+  void registerScalarFunction(kj::StringPtr name, int argCount, ScalarUdfCallback callback);
+
+  // Register a user-defined aggregate function with SQLite.
+  //
+  // `name` - The SQL function name. Must not conflict with built-in functions.
+  // `argCount` - Number of arguments, or -1 for variadic functions.
+  // `stepCallback` - Function called for each row to accumulate state.
+  // `finalCallback` - Function called after all rows to produce final result.
+  //
+  // The callbacks are invoked synchronously during SQL query execution.
+  void registerAggregateFunction(kj::StringPtr name,
+      int argCount,
+      AggregateStepCallback stepCallback,
+      AggregateFinalCallback finalCallback);
+
+  // Check if a function name (case-insensitive) matches a built-in SQLite function.
+  // Used to prevent UDFs from shadowing critical built-ins like count(), sum(), etc.
+  static bool isBuiltInFunction(kj::StringPtr name);
+
  private:
+  // Store an exception that occurred in a UDF callback.
+  // This is called by the UDF callback when an exception is thrown, so that
+  // the exception can be rethrown after sqlite3_step() returns. This allows
+  // us to preserve the full exception (including tunneled JS exceptions with
+  // their stack traces) instead of losing it when converting to a SQLite error.
+  void setPendingUdfException(kj::Exception&& exception) {
+    // First error wins — if a query invokes multiple UDFs that both throw,
+    // we preserve the first exception rather than silently clobbering it.
+    if (pendingUdfException == kj::none) {
+      pendingUdfException = kj::mv(exception);
+    }
+  }
+
   const Vfs& vfs;
   kj::Path path;
   bool readOnly;
@@ -355,6 +424,27 @@ class SqliteDatabase {
 
   // True if in a BEGIN TRANSACTION transaction.
   bool inTransaction = false;
+
+  // Storage for registered user-defined functions.
+  // The callback must be stored as a raw pointer inside SQLite's user_data,
+  // so we keep ownership here in a HashMap. The structs are defined in sqlite.c++
+  // because their definitions use callback types that can't be completed here.
+  // The static callback functions in sqlite.c++ access them via sqlite3_user_data().
+  struct RegisteredUdf;
+  struct RegisteredAggregateUdf;
+
+  // The SQLite C API callbacks need to cast user_data back to the registered UDF types.
+  friend void udfCallback(sqlite3_context*, int, sqlite3_value**);
+  friend void aggregateStepCallback(sqlite3_context*, int, sqlite3_value**);
+  friend void aggregateFinalCallback(sqlite3_context*);
+  kj::HashMap<kj::StringPtr, kj::Own<RegisteredUdf>> registeredUdfs;
+  kj::HashMap<kj::StringPtr, kj::Own<RegisteredAggregateUdf>> registeredAggregateUdfs;
+
+  // Exception thrown by a UDF callback, stored here so it can be rethrown after
+  // sqlite3_step() returns. This allows us to preserve the original exception
+  // (including stack traces for JavaScript exceptions) instead of losing it
+  // when converting to a SQLite error string.
+  kj::Maybe<kj::Exception> pendingUdfException;
 
   void init(kj::Maybe<kj::WriteMode> maybeMode);
 
@@ -1004,5 +1094,22 @@ inline SqliteDatabase::Statement SqliteDatabase::prepareMulti(
     const Regulator& regulator, kj::String sqlCode) {
   return Statement(*this, regulator, kj::mv(sqlCode));
 }
+
+// =============================================================================
+// UDF Support Classes
+// =============================================================================
+
+// Note: The UdfArgument and UdfContext classes are defined in sqlite.c++ because they
+// require the full sqlite3.h definitions. They're used internally by the UDF callback
+// infrastructure and are not needed in the header.
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+// Convert a string to ASCII lowercase. Used for case-insensitive SQL function name
+// normalization. SQLite function names are case-insensitive, so we normalize to
+// lowercase for consistent HashMap lookups.
+kj::String toLowercase(kj::StringPtr str);
 
 }  // namespace workerd

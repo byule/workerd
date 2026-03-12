@@ -43,11 +43,13 @@ def wd_test(
         name = src.removesuffix(".capnp").removesuffix(".wd-test").removesuffix(".ts-wd-test")
 
     if len(ts_srcs) != 0:
-        # Generated declarations are currently not being used, but required based on https://github.com/aspect-build/rules_ts/issues/719
-        # TODO(build perf): Consider adopting isolated_typecheck to avoid bottlebecks in TS
-        # compilation, see https://github.com/aspect-build/rules_ts/blob/f1b7b83/docs/performance.md#isolated-typecheck.
-        # This will require extensive refactoring and we may only want to enable it for some
-        # targets, but might be useful if we end up transpiling more code later on.
+        # NOTE: We intentionally do not use isolated_typecheck here. While isolated_typecheck can
+        # improve build parallelism by separating transpilation from type-checking, it requires
+        # isolatedDeclarations in tsconfig (which mandates explicit return type annotations on all
+        # exports) and uses --noResolve during transpilation. The --noResolve flag prevents
+        # TypeScript from finding @types/node, breaking IDE support for Node.js imports like
+        # 'node:assert'. Since wd_test TypeScript files are typically standalone test files (leaf
+        # nodes in the dependency graph), the parallelization benefits would be minimal anyway.
         ts_config(
             name = name + "@ts_config",
             src = "tsconfig.json",
@@ -57,9 +59,6 @@ def wd_test(
             name = name + "@ts_project",
             srcs = ts_srcs,
             tsconfig = ":" + name + "@ts_config",
-            allow_js = True,
-            source_map = True,
-            declaration = True,
             deps = ["//src/node:node@tsproject"] + ts_deps,
         )
         data += [js_src.removesuffix(".ts") + ".js" for js_src in ts_srcs]
@@ -132,8 +131,14 @@ set TEST_EXIT=!ERRORLEVEL!
 exit /b !TEST_EXIT!
 """
 
-SH_TEMPLATE = """#!/bin/sh
-set -e
+SH_TEMPLATE = """#!/bin/bash
+set -euo pipefail
+
+# Set up coverage for workerd subprocess
+if [ -n "${{COVERAGE_DIR:-}}" ]; then
+    export LLVM_PROFILE_FILE="${{COVERAGE_DIR}}/%p-%m.profraw"
+    export KJ_CLEAN_SHUTDOWN=1
+fi
 
 # Run supervisor to start sidecar if specified
 if [ ! -z "{sidecar}" ]; then
@@ -236,8 +241,6 @@ def _wd_test_impl(ctx):
         ctx,
         source_attributes = ["src", "data"],
         dependency_attributes = ["workerd", "sidecar", "sidecar_supervisor"],
-        # Include all file types that might contain testable code
-        extensions = ["cc", "c++", "cpp", "cxx", "c", "h", "hh", "hpp", "hxx", "inc", "js", "ts", "mjs", "wd-test", "capnp"],
     )
     environment = dict(ctx.attr.env)
     if ctx.attr.python_snapshot_test:
@@ -276,11 +279,14 @@ _wd_test = rule(
         ),
         # Source file
         "src": attr.label(allow_single_file = True),
-        # The workerd executable is used to run all tests
+        # The workerd executable is used to run all tests.
+        # Using cfg = "target" instead of "exec" ensures workerd is built with coverage
+        # instrumentation when running `bazel coverage`. With cfg = "exec", the binary
+        # would be built in exec configuration which doesn't include coverage flags.
         "workerd": attr.label(
             allow_single_file = True,
             executable = True,
-            cfg = "exec",
+            cfg = "target",
             default = "//src/workerd/server:workerd_cross",
         ),
         # A list of files that this test requires to be present in order to run.

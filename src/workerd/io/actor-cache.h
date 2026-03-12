@@ -48,6 +48,13 @@ struct ActorCacheWriteOptions {
   bool noCache = false;
 };
 
+struct DeleteAllOptions {
+  // When true, deleteAll() will also delete any scheduled alarm. The alarm deletion is
+  // guaranteed to take effect only after the deleteAll() itself succeeds, so that we never
+  // end up in a state where the alarm is deleted but KV data remains.
+  bool deleteAlarm = false;
+};
+
 // Common interface between ActorCache and ActorCache::Transaction.
 class ActorCacheOps {
  public:
@@ -214,7 +221,8 @@ class ActorCacheInterface: public ActorCacheOps {
   // The returned count only includes keys that were actually deleted from storage, not keys in
   // cache -- we only use the returned deleteAll count for billing, and not counting deletes of
   // entries that are only in cache is no problem for billing, those deletes don't cost us anything.
-  virtual DeleteAllResults deleteAll(WriteOptions options, SpanParent traceSpan) = 0;
+  virtual DeleteAllResults deleteAll(
+      WriteOptions options, SpanParent traceSpan, DeleteAllOptions deleteAllOptions = {}) = 0;
 
   // Call each time the isolate lock is taken to evict stale entries. If this returns a promise,
   // then the caller must hold off on JavaScript execution until the promise resolves -- this
@@ -243,8 +251,12 @@ class ActorCacheInterface: public ActorCacheOps {
   };
 
   // Call when entering the alarm handler.
+  //
+  // `currentTime` is used to determine if an overdue alarm should run immediately even when
+  // the local alarm state differs from the scheduled time (to avoid blocking on storage sync).
   virtual kj::OneOf<CancelAlarmHandler, RunAlarmHandler> armAlarmHandler(kj::Date scheduledTime,
       SpanParent parentSpan,
+      kj::Date currentTime,
       bool noCache = false,
       kj::StringPtr actorId = "") = 0;
 
@@ -357,12 +369,14 @@ class ActorCache final: public ActorCacheInterface {
   // See ActorCacheOps.
 
   kj::Own<ActorCacheInterface::Transaction> startTransaction() override;
-  DeleteAllResults deleteAll(WriteOptions options, SpanParent traceSpan) override;
+  DeleteAllResults deleteAll(
+      WriteOptions options, SpanParent traceSpan, DeleteAllOptions deleteAllOptions = {}) override;
   kj::Maybe<kj::Promise<void>> evictStale(kj::Date now) override;
   void shutdown(kj::Maybe<const kj::Exception&> maybeException) override;
 
   kj::OneOf<CancelAlarmHandler, RunAlarmHandler> armAlarmHandler(kj::Date scheduledTime,
       SpanParent parentSpan,
+      kj::Date currentTime,
       bool noCache = false,
       kj::StringPtr actorId = "") override;
   void cancelDeferredAlarmDeletion() override;
@@ -757,6 +771,9 @@ class ActorCache final: public ActorCacheInterface {
     // deleteAll().
     kj::Vector<kj::Own<Entry>> deletedDirty;
     kj::Own<kj::PromiseFulfiller<uint>> countFulfiller;
+
+    // If true, the alarm should also be deleted after the deleteAll() RPC succeeds.
+    bool deleteAlarm = false;
   };
 
   kj::Maybe<DeleteAllState> requestedDeleteAll;

@@ -42,6 +42,31 @@ pub fn jsg_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
     });
 
+    let field_extractions = fields.named.iter().filter_map(|field| {
+        if !matches!(field.vis, syn::Visibility::Public(_)) {
+            return None;
+        }
+        let field_name = field.ident.as_ref()?;
+        let field_name_str = field_name.to_string();
+        let field_type = &field.ty;
+        Some(quote! {
+            let #field_name = {
+                let prop = obj.get(lock, #field_name_str)
+                    .ok_or_else(|| jsg::Error::new_type_error(
+                        format!("Missing property '{}'", #field_name_str)
+                    ))?;
+                <#field_type as jsg::FromJS>::from_js(lock, prop)?
+            };
+        })
+    });
+
+    let field_names = fields.named.iter().filter_map(|field| {
+        if !matches!(field.vis, syn::Visibility::Public(_)) {
+            return None;
+        }
+        field.ident.as_ref()
+    });
+
     quote! {
         #input
 
@@ -73,8 +98,15 @@ pub fn jsg_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl jsg::FromJS for #name {
             type ResultType = Self;
 
-            fn from_js(_lock: &mut jsg::Lock, _value: jsg::v8::Local<jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
-                todo!("Struct from_js is not yet supported")
+            fn from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
+                if !value.is_object() {
+                    return Err(jsg::Error::new_type_error(
+                        format!("Expected object but got {}", value.type_of())
+                    ));
+                }
+                let obj: jsg::v8::Local<'_, jsg::v8::Object> = value.into();
+                #(#field_extractions)*
+                Ok(Self { #(#field_names),* })
             }
         }
 
@@ -96,6 +128,13 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_block = &input_fn.block;
     let callback_name = syn::Ident::new(&format!("{fn_name}_callback"), fn_name.span());
 
+    // Methods with a receiver (&self, &mut self) become instance methods on the prototype.
+    // Methods without a receiver become static methods on the constructor.
+    let has_self = fn_sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, FnArg::Receiver(_)));
+
     let params: Vec<_> = fn_sig
         .inputs
         .iter()
@@ -105,13 +144,26 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Check if the first typed parameter is `&mut Lock` — if so, pass `&mut lock`
+    // directly instead of extracting it from JS args (like C++ jsg::Lock&).
+    let has_lock_param = params.first().is_some_and(|ty| is_lock_ref(ty));
+    let js_arg_offset = usize::from(has_lock_param);
+
     let (unwraps, arg_exprs): (Vec<_>, Vec<_>) = params
         .iter()
         .enumerate()
         .map(|(i, ty)| {
-            let arg = syn::Ident::new(&format!("arg{i}"), fn_name.span());
+            // First param is &mut Lock — pass the callback's lock directly.
+            if i == 0 && has_lock_param {
+                let unwrap = quote! {};
+                let arg_expr = quote! { &mut lock };
+                return (unwrap, arg_expr);
+            }
+
+            let js_index = i - js_arg_offset;
+            let arg = syn::Ident::new(&format!("arg{js_index}"), fn_name.span());
             let unwrap = quote! {
-                let #arg = match <#ty as jsg::FromJS>::from_js(&mut lock, args.get(#i)) {
+                let #arg = match <#ty as jsg::FromJS>::from_js(&mut lock, args.get(#js_index)) {
                     Ok(v) => v,
                     Err(err) => {
                         lock.throw_exception(&err);
@@ -147,6 +199,18 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let invocation = if has_self {
+        quote! {
+            let this = args.this();
+            let self_ = jsg::unwrap_resource::<Self>(&mut lock, this);
+            let result = self_.#fn_name(#(#arg_exprs),*);
+        }
+    } else {
+        quote! {
+            let result = Self::#fn_name(#(#arg_exprs),*);
+        }
+    };
+
     quote! {
         #fn_vis #fn_sig { #fn_block }
 
@@ -155,9 +219,7 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let mut lock = unsafe { jsg::Lock::from_args(args) };
             let mut args = unsafe { jsg::v8::FunctionCallbackInfo::from_ffi(args) };
             #(#unwraps)*
-            let this = args.this();
-            let self_ = jsg::unwrap_resource::<Self>(&mut lock, this);
-            let result = self_.#fn_name(#(#arg_exprs),*);
+            #invocation
             #result_handling
         }
     }
@@ -259,8 +321,50 @@ fn generate_resource_impl(impl_block: &ItemImpl) -> TokenStream {
                 .unwrap_or_else(|| snake_to_camel(&rust_name.to_string()));
             let callback = syn::Ident::new(&format!("{rust_name}_callback"), rust_name.span());
 
+            // Methods with a receiver (&self, &mut self) become instance methods on the prototype.
+            // Methods without a receiver become static methods on the constructor.
+            let has_self = method
+                .sig
+                .inputs
+                .iter()
+                .any(|arg| matches!(arg, FnArg::Receiver(_)));
+
+            if has_self {
+                Some(quote! {
+                    jsg::Member::Method { name: #js_name.to_owned(), callback: Self::#callback }
+                })
+            } else {
+                Some(quote! {
+                    jsg::Member::StaticMethod { name: #js_name.to_owned(), callback: Self::#callback }
+                })
+            }
+        })
+        .collect();
+
+    let constant_registrations: Vec<_> = impl_block
+        .items
+        .iter()
+        .filter_map(|item| {
+            let syn::ImplItem::Const(constant) = item else {
+                return None;
+            };
+            let attr = constant.attrs.iter().find(|a| {
+                a.path().is_ident("jsg_static_constant")
+                    || a.path()
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "jsg_static_constant")
+            })?;
+
+            let rust_name = &constant.ident;
+            let js_name = extract_name_attribute(&attr.meta.to_token_stream().to_string())
+                .unwrap_or_else(|| rust_name.to_string());
+
             Some(quote! {
-                jsg::Member::Method { name: #js_name.to_owned(), callback: Self::#callback }
+                jsg::Member::StaticConstant {
+                    name: #js_name.to_owned(),
+                    value: jsg::ConstantValue::from(Self::#rust_name),
+                }
             })
         })
         .collect();
@@ -287,7 +391,7 @@ fn generate_resource_impl(impl_block: &ItemImpl) -> TokenStream {
         #[automatically_derived]
         impl jsg::Resource for #self_ty {
             fn members() -> Vec<jsg::Member> where Self: Sized {
-                vec![#(#method_registrations,)*]
+                vec![#(#method_registrations,)* #(#constant_registrations,)*]
             }
 
             fn get_drop_fn(&self) -> unsafe extern "C" fn(*mut jsg::v8::ffi::Isolate, *mut std::os::raw::c_void) {
@@ -345,4 +449,174 @@ fn is_result_type(ty: &syn::Type) -> bool {
         return segment.ident == "Result";
     }
     false
+}
+
+/// Marks a `const` item inside a `#[jsg_resource]` impl block as a static constant
+/// exposed to JavaScript on both the constructor and prototype.
+///
+/// The constant name is used as-is for the JavaScript property name (no camelCase
+/// conversion), matching the convention that constants are `UPPER_SNAKE_CASE` in
+/// both Rust and JavaScript.
+///
+/// Only numeric types are supported (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`).
+///
+/// # Example
+///
+/// ```ignore
+/// #[jsg_resource]
+/// impl MyResource {
+///     #[jsg_static_constant]
+///     pub const MAX_SIZE: u32 = 1024;
+///
+///     #[jsg_static_constant]
+///     pub const STATUS_OK: i32 = 0;
+/// }
+/// // In JavaScript: MyResource.MAX_SIZE === 1024
+/// ```
+#[proc_macro_attribute]
+pub fn jsg_static_constant(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Marker attribute — the actual registration is handled by #[jsg_resource] on the impl block.
+    item
+}
+
+/// Returns true if the type is `&mut Lock` or `&mut jsg::Lock`.
+///
+/// When a method's first typed parameter matches this pattern, the macro passes the
+/// callback's `lock` directly instead of extracting it from JavaScript arguments.
+fn is_lock_ref(ty: &syn::Type) -> bool {
+    let syn::Type::Reference(ref_type) = ty else {
+        return false;
+    };
+    if ref_type.mutability.is_none() {
+        return false;
+    }
+    let syn::Type::Path(type_path) = ref_type.elem.as_ref() else {
+        return false;
+    };
+    let segments: Vec<_> = type_path.path.segments.iter().collect();
+    match segments.len() {
+        // `&mut Lock` — bare import (assumes `use jsg::Lock;`)
+        1 => segments[0].ident == "Lock",
+        // `&mut jsg::Lock` — fully qualified path
+        2 => segments[0].ident == "jsg" && segments[1].ident == "Lock",
+        _ => false,
+    }
+}
+
+/// Generates `jsg::Type` and `jsg::FromJS` implementations for union types.
+///
+/// This macro automatically implements the traits needed for enums with
+/// single-field tuple variants to be used directly as `jsg_method` parameters.
+/// Each variant should contain a type that implements `jsg::Type` and `jsg::FromJS`.
+///
+/// # Example
+///
+/// ```ignore
+/// use jsg_macros::jsg_oneof;
+///
+/// #[jsg_oneof]
+/// #[derive(Debug, Clone)]
+/// enum StringOrNumber {
+///     String(String),
+///     Number(f64),
+/// }
+///
+/// // Use directly as a parameter type:
+/// #[jsg_method]
+/// fn process(&self, value: StringOrNumber) -> Result<String, jsg::Error> {
+///     match value {
+///         StringOrNumber::String(s) => Ok(format!("string: {}", s)),
+///         StringOrNumber::Number(n) => Ok(format!("number: {}", n)),
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn jsg_oneof(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let name = &input.ident;
+
+    let Data::Enum(data) = &input.data else {
+        return error(&input, "#[jsg_oneof] can only be applied to enums");
+    };
+
+    let mut variants = Vec::new();
+    for variant in &data.variants {
+        let variant_name = &variant.ident;
+        let Fields::Unnamed(fields) = &variant.fields else {
+            return error(
+                variant,
+                "#[jsg_oneof] variants must be tuple variants (e.g., `Variant(Type)`)",
+            );
+        };
+        if fields.unnamed.len() != 1 {
+            return error(variant, "#[jsg_oneof] variants must have exactly one field");
+        }
+        let inner_type = &fields.unnamed[0].ty;
+        variants.push((variant_name, inner_type));
+    }
+
+    if variants.is_empty() {
+        return error(&input, "#[jsg_oneof] requires at least one variant");
+    }
+
+    let type_checks: Vec<_> = variants
+        .iter()
+        .map(|(variant_name, inner_type)| {
+            quote! {
+                if let Some(result) = <#inner_type as jsg::FromJS>::try_from_js_exact(lock, &value) {
+                    return result.map(Self::#variant_name);
+                }
+            }
+        })
+        .collect();
+
+    let type_names: Vec<_> = variants
+        .iter()
+        .map(|(_, inner_type)| {
+            quote! { <#inner_type as jsg::Type>::class_name() }
+        })
+        .collect();
+
+    let is_exact_checks: Vec<_> = variants
+        .iter()
+        .map(|(_, inner_type)| {
+            quote! { <#inner_type as jsg::Type>::is_exact(value) }
+        })
+        .collect();
+
+    let error_msg = quote! {
+        let expected: Vec<&str> = vec![#(#type_names),*];
+        let msg = format!(
+            "Expected one of [{}] but got {}",
+            expected.join(", "),
+            value.type_of()
+        );
+        Err(jsg::Error::new_type_error(msg))
+    };
+
+    quote! {
+        #input
+
+        #[automatically_derived]
+        impl jsg::Type for #name {
+            fn class_name() -> &'static str {
+                stringify!(#name)
+            }
+
+            fn is_exact(value: &jsg::v8::Local<jsg::v8::Value>) -> bool {
+                #(#is_exact_checks)||*
+            }
+        }
+
+        #[automatically_derived]
+        impl jsg::FromJS for #name {
+            type ResultType = Self;
+
+            fn from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
+                #(#type_checks)*
+                #error_msg
+            }
+        }
+    }
+    .into()
 }

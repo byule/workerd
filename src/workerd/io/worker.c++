@@ -13,6 +13,7 @@
 #include <workerd/io/features.h>
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/tracer.h>
+#include <workerd/io/wasm-instantiate-shim.embed.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/inspector.h>
@@ -23,6 +24,7 @@
 #include <workerd/jsg/util.h>
 #include <workerd/rust/jsg/lib.rs.h>
 #include <workerd/rust/jsg/v8.rs.h>
+#include <workerd/util/autogate.h>
 #include <workerd/util/batch-queue.h>
 #include <workerd/util/color-util.h>
 #include <workerd/util/mimetype.h>
@@ -34,6 +36,7 @@
 #include <rust/jsg/ffi.h>
 #include <v8-inspector.h>
 #include <v8-profiler.h>
+#include <v8-wasm.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -249,7 +252,8 @@ void reportStartupError(kj::StringPtr id,
     v8::TryCatch& catcher,
     kj::Maybe<Worker::ValidationErrorReporter&> errorReporter,
     kj::Maybe<kj::Exception>& permanentException,
-    SpanParent parentSpan) {
+    SpanParent parentSpan,
+    bool isDynamicWorker) {
   v8::TryCatch catcher2(js.v8Isolate);
   ExceptionOrDuration limitErrorOrTime2 = 0 * kj::NANOSECONDS;
   try {
@@ -299,6 +303,7 @@ void reportStartupError(kj::StringPtr id,
               // won't be able to connect and the developer will never know what happened.
             } else {
               // We should never get here in production if we've validated scripts before deployment.
+              // (unless this is a dynamic worker)
               kj::Vector<kj::String> lines;
               jsg::JsMessage message(catcher.Message());
               message.addJsStackTrace(js, lines);
@@ -310,7 +315,12 @@ void reportStartupError(kj::StringPtr id,
                   kj::ConstString(
                       kj::str("script startup threw exception", id, description, trace)));
               KJ_LOG(ERROR, "script startup threw exception", id, description, trace);
-              KJ_FAIL_REQUIRE("script startup threw exception");
+              if (isDynamicWorker) {
+                // Rethrow the tunneled JSG exception so it converts back to a JS Error.
+                kj::throwFatalException(kj::cp(KJ_ASSERT_NONNULL(permanentException)));
+              } else {
+                KJ_FAIL_REQUIRE("script startup threw exception");
+              }
             }
           });
         } else {
@@ -657,6 +667,9 @@ struct Worker::Isolate::Impl {
 
     void gcPrologue() {
       metrics.gcPrologue();
+      // Filter out tracked WASM instance entries where the module has exited, allowing
+      // the linear memory to be reclaimed.
+      limitEnforcer.getTrackedWasmInstances().filter(*lock);
     }
     void gcEpilogue() {
       metrics.gcEpilogue();
@@ -719,9 +732,12 @@ struct Worker::Isolate::Impl {
     kj::Maybe<std::unique_ptr<v8_inspector::V8Inspector>> inspector;
     jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
       auto lock = api.lock(stackScope);
-      realm = ::workerd::rust::jsg::realm_create(lock->v8Isolate);
+      auto featureFlagsWords = capnp::canonicalize(api.getFeatureFlags());
+      realm = ::workerd::rust::jsg::realm_create(
+          lock->v8Isolate, featureFlagsWords.asBytes().as<kj_rs::Rust>());
       lock->v8Isolate->SetData(
           ::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, &*KJ_REQUIRE_NONNULL(realm));
+
       limitEnforcer.customizeIsolate(lock->v8Isolate);
       if (inspectorPolicy != InspectorPolicy::DISALLOW) {
         // We just created our isolate, so we don't need to use Isolate::Impl::Lock.
@@ -1101,11 +1117,17 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
     if (features.getShouldSetImmutablePrototype() || features.getPythonWorkers()) {
       lock->setImmutablePrototype();
     }
+    if (features.getSpecCompliantPropertyAttributes()) {
+      lock->setSpecCompliantPropertyAttributes();
+    }
     if (features.getNodeJsCompatV2()) {
       lock->setNodeJsCompatEnabled();
     }
     if (features.getEnableNodeJsProcessV2()) {
       lock->setNodeJsProcessV2Enabled();
+    }
+    if (features.getRequireReturnsDefaultExport()) {
+      lock->setRequireReturnsDefaultExportEnabled();
     }
     if (features.getThrowOnUnrecognizedImportAssertion()) {
       lock->setThrowOnUnrecognizedImportAssertion();
@@ -1491,7 +1513,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
         } catch (const jsg::JsExceptionThrown&) {
           reportStartupError(id, lock, isolate->impl->inspector, isolate->getLimitEnforcer(),
               kj::mv(limitErrorOrTime), catcher, errorReporter, impl->permanentException,
-              parentSpan.addRef());
+              parentSpan.addRef(), dynamicEnvBuilder != kj::none);
         }
       });
     });
@@ -1549,6 +1571,11 @@ Worker::Isolate::~Isolate() noexcept(false) {
     // The Rust Realm must be dropped under lock since Realm::drop() accesses V8 globals
     // and calls drop functions that may interact with V8.
     auto dropRealm = kj::mv(impl->realm);
+
+    // Release all tracked WASM instance entries while V8 is still alive. Each entry holds a
+    // shared_ptr<v8::BackingStore> whose destructor who needs the isolate to still be alive.
+    // This is analogous to the cpuTimeLimitNearlyExceededCallback detaching above ^^^
+    limitEnforcer->getTrackedWasmInstances().clear(*recordedLock.lock);
   });
 }
 
@@ -1580,7 +1607,8 @@ bool Worker::Isolate::Impl::Lock::checkInWithLimitEnforcer(Worker::Isolate& isol
 }
 
 kj::Maybe<kj::Function<void(void)>> Worker::Isolate::getCpuLimitNearlyExceededCallback() const {
-  KJ_IF_SOME(cb, *cpuLimitNearlyExceededCallback.lockExclusive()) {
+  auto lock = cpuLimitNearlyExceededCallback.lockExclusive();
+  KJ_IF_SOME(cb, *lock) {
     return cb.reference();
   }
   return kj::none;
@@ -1597,31 +1625,109 @@ void Worker::Isolate::setCpuLimitNearlyExceededCallback(kj::Function<void(void)>
       FAILED, "Python Workers Internal Error: CpuLimitNearlyExceededCallback already set"));
 }
 
+void Worker::Isolate::registerTrackedWasmInstance(jsg::Lock& js,
+    kj::Array<kj::byte> memory,
+    kj::Maybe<uint32_t> signalOffset,
+    uint32_t terminatedOffset) const {
+  // Register the WASM module for receiving shutdown signals. The signal handler will
+  // iterate the list unconditionally when CPU time is nearly exhausted.
+  limitEnforcer->getTrackedWasmInstances().registerSignal(
+      js, kj::mv(memory), kj::mv(signalOffset), terminatedOffset);
+}
+
 // EW-1319: Set WebAssembly.Module @@HasInstance
 //
 // The instanceof operator can be changed by setting the @@HasInstance method
 // on the object, https://tc39.es/ecma262/#sec-instanceofoperator.
 void setWebAssemblyModuleHasInstance(jsg::Lock& lock, v8::Local<v8::Context> context) {
-  auto instanceof = [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-    jsg::Lock::from(info.GetIsolate()).withinHandleScope([&] {
-      info.GetReturnValue().Set(info[0]->IsWasmModuleObject());
+  JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& lock) {
+    auto instanceof = [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      jsg::Lock::from(info.GetIsolate()).withinHandleScope([&] {
+        info.GetReturnValue().Set(info[0]->IsWasmModuleObject());
+      });
+    };
+    v8::Local<v8::Function> function = jsg::check(v8::Function::New(context, instanceof));
+
+    auto webAssembly =
+        KJ_ASSERT_NONNULL(lock.global().get(lock, "WebAssembly").tryCast<jsg::JsObject>());
+    auto module = KJ_ASSERT_NONNULL(webAssembly.get(lock, "Module").tryCast<jsg::JsObject>());
+
+    jsg::check(v8::Local<v8::Object>(module)->DefineOwnProperty(
+        context, v8::Symbol::GetHasInstance(lock.v8Isolate), function));
+  });
+}
+
+// Installs a shim around WebAssembly.instantiate and WebAssembly.Instance that hooks into the
+// shutdown signal if it exists
+void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context) {
+  // We need to enter the context because this function compiles and executes JavaScript via
+  // v8::Script::Compile/Run. setupContext() is called before JSG_WITHIN_CONTEXT_SCOPE, so the
+  // context is not yet entered at this point.
+  v8::Context::Scope contextScope(context);
+
+  auto webAssembly =
+      KJ_ASSERT_NONNULL(lock.global().get(lock, "WebAssembly").tryCast<jsg::JsObject>());
+
+  // Create a C++ callback that the JS shims call to register a {memory, signalOffset,
+  // terminatedOffset} tuple.
+  // __registerTrackedWasmInstance(memory: WebAssembly.Memory, signalOffset: number,
+  //                              terminatedOffset: number)
+  // signalOffset may be -1, indicating the module did not export __instance_signal.
+  auto registerCb = [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto& js = jsg::Lock::from(info.GetIsolate());
+    js.withinHandleScope([&] {
+      if (info.Length() < 3 || !info[0]->IsWasmMemoryObject() || !info[1]->IsNumber() ||
+          !info[2]->IsUint32()) {
+        js.v8Isolate->ThrowException(js.str(
+            "registerTrackedWasmInstance: expected (WebAssembly.Memory, number, uint32)"_kj));
+        return;
+      }
+      auto memory = info[0].As<v8::WasmMemoryObject>();
+      // signalOffset is -1 when __instance_signal was not exported.
+      auto signalRaw = info[1].As<v8::Number>()->Value();
+      kj::Maybe<uint32_t> signalOffset;
+      if (signalRaw >= 0) {
+        signalOffset = static_cast<uint32_t>(signalRaw);
+      }
+      auto terminatedOffset = info[2].As<v8::Uint32>()->Value();
+      auto backingStore = memory->Buffer()->GetBackingStore();
+      auto wasmMemory =
+          kj::arrayPtr(static_cast<kj::byte*>(backingStore->Data()), backingStore->ByteLength())
+              .attach(kj::mv(backingStore));
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&] {
+        Worker::Isolate::from(js).registerTrackedWasmInstance(
+            js, kj::mv(wasmMemory), signalOffset, terminatedOffset);
+      })) {
+        js.v8Isolate->ThrowException(js.exceptionToJs(kj::mv(e)).getHandle(js));
+      }
     });
   };
-  v8::Local<v8::Function> function = jsg::check(v8::Function::New(context, instanceof));
+  auto registerFn = jsg::check(v8::Function::New(context, registerCb));
 
-  v8::Object* webAssembly = v8::Object::Cast(*jsg::check(
-      context->Global()->Get(context, jsg::v8StrIntern(lock.v8Isolate, "WebAssembly"))));
-  v8::Object* module = v8::Object::Cast(
-      *jsg::check(webAssembly->Get(context, jsg::v8StrIntern(lock.v8Isolate, "Module"))));
+  // Build the shim in JavaScript. It wraps both WebAssembly.instantiate (async) and
+  // WebAssembly.Instance (sync constructor).
+  auto shimScript =
+      jsg::NonModuleScript::compile(lock, WASM_INSTANTIATE_SHIM, "wasm-instantiate-shim.js"_kj);
+  auto shimFn = KJ_ASSERT_NONNULL(shimScript.runAndReturn(lock).tryCast<jsg::JsFunction>());
 
-  jsg::check(
-      module->DefineOwnProperty(context, v8::Symbol::GetHasInstance(lock.v8Isolate), function));
+  // Grab the originals before they are replaced.
+  auto originalInstantiate = webAssembly.get(lock, "instantiate");
+  auto originalInstance = webAssembly.get(lock, "Instance");
+
+  // Call the factory — it mutates `wa` in place.
+  shimFn.call(lock, lock.global(), originalInstantiate, originalInstance,
+      jsg::JsFunction(registerFn), jsg::JsObject(webAssembly));
 }
 
 void Worker::setupContext(
     jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions) {
   // Set WebAssembly.Module @@HasInstance
   setWebAssemblyModuleHasInstance(lock, context);
+
+  // Shim WebAssembly.instantiate to detect modules exporting "__instance_signal".
+  if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
+    shimWebAssemblyInstantiate(lock, context);
+  }
 
   // We replace the default V8 console.log(), etc. methods, to give the worker access to
   // logged content, and log formatted values to stdout/stderr locally.
@@ -1708,7 +1814,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         v8::Local<v8::Object> target,
         v8::Local<v8::Object> ctxExports)> compileBindings,
     IsolateObserver::StartType startType,
-    TraceParentContext spans,
+    SpanParent parentSpan,
     LockType lockType,
     kj::Maybe<ValidationErrorReporter&> errorReporter,
     kj::Maybe<kj::Duration&> startupTime)
@@ -1731,7 +1837,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
     });
 
     auto maybeMakeSpan = [&](auto operationName) -> SpanBuilder {
-      auto span = spans.parentSpan.newChild(kj::mv(operationName));
+      auto span = parentSpan.newChild(kj::mv(operationName));
       if (span.isObserved()) {
         span.setTag("truncated_script_id"_kjc, truncateScriptId(script->getId()));
       }
@@ -1819,8 +1925,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
             // Execute script.
             currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
-            SpanBuilder currentUserSpan =
-                spans.userParentSpan.newChild("lw:top_level_execution"_kjc);
 
             // Ensure that our worker top-level bootstrap has a temporary directory
             // storage scope. This is used to store temporary files created within
@@ -1844,6 +1948,13 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                 auto limitScope =
                     script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
                 unboundScript.run(lock);
+                // Flush microtasks enqueued during top-level script evaluation.
+                // Without this flush, microtasks (e.g. promise continuations from async
+                // initialization) remain on the per-isolate microtask queue and can leak across
+                // V8 contexts when multiple Workers share an isolate (same script, different
+                // zones). The leaked microtasks then execute under the wrong IoContext, making
+                // things go boom.
+                lock.runMicrotasks();
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
                 KJ_IF_SOME(ns,
@@ -1920,9 +2031,16 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         } catch (const jsg::JsExceptionThrown&) {
           reportStartupError(script->id, lock, script->isolate->impl->inspector,
               script->isolate->getLimitEnforcer(), kj::mv(limitErrorOrTime), catcher, errorReporter,
-              impl->permanentException, currentSpan);
+              impl->permanentException, currentSpan, script->getDynamicEnvBuilder() != kj::none);
         }
       });
+
+      // Reset this back to its default after startup execution
+      // Leaving it on comes at the expense of collecting stack traces for all thrown exceptions
+      // Ref: https://github.com/cloudflare/workerd/issues/5332
+      if (script->isolate->impl->inspector == kj::none) {
+        lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
+      }
     });
   });
 }
@@ -2191,7 +2309,10 @@ static inline kj::Own<T> fakeOwn(T& ref) {
 }
 
 kj::Maybe<kj::Own<api::ExportedHandler>> Worker::Lock::getExportedHandler(
-    kj::Maybe<kj::StringPtr> name, Frankenvalue props, kj::Maybe<Worker::Actor&> actor) {
+    kj::Maybe<kj::StringPtr> name,
+    kj::Maybe<VersionInfo> versionInfo,
+    Frankenvalue props,
+    kj::Maybe<Worker::Actor&> actor) {
   KJ_IF_SOME(a, actor) {
     KJ_IF_SOME(h, a.getHandler()) {
       return fakeOwn(h);
@@ -2205,7 +2326,8 @@ kj::Maybe<kj::Own<api::ExportedHandler>> Worker::Lock::getExportedHandler(
     jsg::Lock& js = *this;
     auto handler = kj::heap(cls(js,
         js.alloc<api::ExecutionContext>(js,
-            jsg::JsValue(KJ_ASSERT_NONNULL(worker.impl->ctxExports).getHandle(js)), props.toJs(js)),
+            jsg::JsValue(KJ_ASSERT_NONNULL(worker.impl->ctxExports).getHandle(js)), props.toJs(js),
+            kj::mv(versionInfo)),
         KJ_ASSERT_NONNULL(worker.impl->env).addRef(js)));
 
     // HACK: We set handler.env and handler.ctx to undefined because we already passed the real
@@ -2222,7 +2344,8 @@ kj::Maybe<kj::Own<api::ExportedHandler>> Worker::Lock::getExportedHandler(
     if (!FeatureFlags::get(js).getReuseCtxAcrossNonclassEvents()) {
       api::ExportedHandler constructedHandler = h.clone(js);
       constructedHandler.ctx = js.alloc<api::ExecutionContext>(js,
-          jsg::JsValue(KJ_ASSERT_NONNULL(worker.impl->ctxExports).getHandle(js)), props.toJs(js));
+          jsg::JsValue(KJ_ASSERT_NONNULL(worker.impl->ctxExports).getHandle(js)), props.toJs(js),
+          kj::mv(versionInfo));
       return kj::heap(kj::mv(constructedHandler));
     }
     return fakeOwn(h);
@@ -3685,14 +3808,6 @@ kj::Promise<Worker::AsyncLock> Worker::takeAsyncLockWhenActorCacheReady(
   }
 
   co_return co_await getIsolate().takeAsyncLockImpl(kj::mv(lockTiming));
-}
-
-void Worker::setConnectOverride(kj::String networkAddress, ConnectFn connectFn) {
-  connectOverrides.upsert(kj::mv(networkAddress), kj::mv(connectFn));
-}
-
-kj::Maybe<Worker::ConnectFn&> Worker::getConnectOverride(kj::StringPtr networkAddress) {
-  return connectOverrides.find(networkAddress);
 }
 
 Worker::Actor::Actor(const Worker& worker,

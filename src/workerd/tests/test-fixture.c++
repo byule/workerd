@@ -57,7 +57,7 @@ class DummyErrorHandler final: public kj::TaskSet::ErrorHandler {
 struct MockTimerChannel final: public TimerChannel {
   void syncTime() override {}
 
-  kj::Date now() override {
+  kj::Date now(kj::Maybe<kj::Date>) override {
     return kj::systemPreciseCalendarClock().now();
   }
 
@@ -78,7 +78,7 @@ struct RealTimerChannel final: public TimerChannel {
 
   void syncTime() override {}
 
-  kj::Date now() override {
+  kj::Date now(kj::Maybe<kj::Date>) override {
     return kj::systemPreciseCalendarClock().now();
   }
 
@@ -104,8 +104,9 @@ struct DummyIoChannelFactory final: public IoChannelFactory {
     KJ_FAIL_ASSERT("no subrequests");
   }
 
-  kj::Own<SubrequestChannel> getSubrequestChannel(
-      uint channel, kj::Maybe<Frankenvalue> props) override {
+  kj::Own<SubrequestChannel> getSubrequestChannel(uint channel,
+      kj::Maybe<Frankenvalue> props,
+      kj::Maybe<VersionRequest> versionRequest) override {
     KJ_FAIL_ASSERT("no subrequests");
   }
 
@@ -132,7 +133,8 @@ struct DummyIoChannelFactory final: public IoChannelFactory {
       ActorGetMode mode,
       bool enableReplicaRouting,
       ActorRoutingMode routingMode,
-      SpanParent parentSpan) override {
+      SpanParent parentSpan,
+      kj::Maybe<ActorVersion> version) override {
     KJ_FAIL_REQUIRE("no actor channels");
   }
 
@@ -251,6 +253,12 @@ struct MockIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   bool hasExcessivelyExceededHeapLimit() const override {
     return false;
   }
+  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
+    return trackedWasmInstances;
+  }
+
+ private:
+  TrackedWasmInstanceList trackedWasmInstances;
 };
 
 struct MockErrorReporter final: public Worker::ValidationErrorReporter {
@@ -396,7 +404,7 @@ TestFixture::TestFixture(SetupParams&& params)
             // no bindings, nothing to do
           },
           IsolateObserver::StartType::COLD,
-          TraceParentContext(nullptr, nullptr), /* spans */
+          SpanParent(nullptr),
           Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)))),
       errorHandler(kj::heap<DummyErrorHandler>()),
       waitUntilTasks(*errorHandler),
@@ -470,7 +478,10 @@ TestFixture::Response TestFixture::runRequest(
   runInIoContext([&](const TestFixture::Environment& env) {
     auto& globalScope = env.lock.getGlobalScope();
     return globalScope.request(method, url, requestHeaders, *requestBody, response, "{}"_kj,
-        env.lock, env.lock.getExportedHandler(kj::none, {}, kj::none), /* abortSignal */ kj::none);
+        env.lock,
+        env.lock.getExportedHandler(/*entryPointName=*/kj::none, /*versionInfo=*/kj::none,
+            /*props=*/{}, /*actor=*/kj::none),
+        /*abortSignal=*/kj::none);
   });
 
   return {.statusCode = response.statusCode, .body = response.body->str()};

@@ -7,7 +7,7 @@ const unitTests :Workerd.Config = (
         modules = [
           (name = "worker", esModule = embed "tty-nodejs-test.js")
         ],
-        compatibilityFlags = ["nodejs_compat", "nodejs_compat_v2", "enable_nodejs_tty_module", "experimental"]
+        compatibilityFlags = ["nodejs_compat", "nodejs_compat_v2", "enable_nodejs_tty_module"]
       )
     ),
   ],

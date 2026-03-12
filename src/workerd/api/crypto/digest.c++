@@ -415,7 +415,7 @@ HashContext HashContext::clone(jsg::Lock& js, kj::Maybe<uint32_t> xofLen) {
       return HashContext(kj::mv(newCtx), kj::mv(xofLen));
     }
     KJ_CASE_ONEOF(digest, jsg::BufferSource) {
-      return HashContext(digest.clone(js), kj::mv(xofLen));
+      JSG_FAIL_REQUIRE(DOMOperationError, "Hash context has already been finalized.");
     }
   }
   KJ_UNREACHABLE;

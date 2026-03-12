@@ -2298,7 +2298,7 @@ export interface Ai_Cf_Qwen_Qwq_32B_Messages {
       }
   )[];
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -2572,7 +2572,7 @@ export interface Ai_Cf_Mistralai_Mistral_Small_3_1_24B_Instruct_Messages {
       }
   )[];
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -2665,7 +2665,7 @@ export interface Ai_Cf_Google_Gemma_3_12B_It_Prompt {
    */
   prompt: string;
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -2829,7 +2829,7 @@ export interface Ai_Cf_Google_Gemma_3_12B_It_Messages {
       }
   )[];
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -3110,7 +3110,7 @@ export interface Ai_Cf_Meta_Llama_4_Scout_17B_16E_Instruct_Messages {
   )[];
   response_format?: Ai_Cf_Meta_Llama_4_Scout_17B_16E_Instruct_JSON_Mode;
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -3349,7 +3349,7 @@ export interface Ai_Cf_Meta_Llama_4_Scout_17B_16E_Instruct_Messages_Inner {
   )[];
   response_format?: Ai_Cf_Meta_Llama_4_Scout_17B_16E_Instruct_JSON_Mode;
   /**
-   * JSON schema that should be fufilled for the response.
+   * JSON schema that should be fulfilled for the response.
    */
   guided_json?: object;
   /**
@@ -4426,7 +4426,7 @@ export interface Ai_Cf_Ai4Bharat_Indictrans2_En_Indic_1B_Input {
    */
   text: string | string[];
   /**
-   * Target langauge to translate to
+   * Target language to translate to
    */
   target_language:
     | "asm_Beng"
@@ -5452,6 +5452,50 @@ export type AiModelListType = Record<string, any>;
 export declare abstract class Ai<AiModelList extends AiModelListType = AiModels> {
   aiGatewayLogId: string | null;
   gateway(gatewayId: string): AiGateway;
+
+  /**
+   * Access the AI Search API for managing AI-powered search instances.
+   *
+   * This is the new API that replaces AutoRAG with better namespace separation:
+   * - Account-level operations: `list()`, `create()`
+   * - Instance-level operations: `get(id).search()`, `get(id).chatCompletions()`, `get(id).delete()`
+   *
+   * @example
+   * ```typescript
+   * // List all AI Search instances
+   * const instances = await env.AI.aiSearch.list();
+   *
+   * // Search an instance
+   * const results = await env.AI.aiSearch.get('my-search').search({
+   *   messages: [{ role: 'user', content: 'What is the policy?' }],
+   *   ai_search_options: {
+   *     retrieval: { max_num_results: 10 }
+   *   }
+   * });
+   *
+   * // Generate chat completions with AI Search context
+   * const response = await env.AI.aiSearch.get('my-search').chatCompletions({
+   *   messages: [{ role: 'user', content: 'What is the policy?' }],
+   *   model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+   * });
+   * ```
+   */
+  aiSearch(): AiSearchAccountService;
+
+  /**
+   * @deprecated AutoRAG has been replaced by AI Search.
+   * Use `env.AI.aiSearch` instead for better API design and new features.
+   *
+   * Migration guide:
+   * - `env.AI.autorag().list()` → `env.AI.aiSearch.list()`
+   * - `env.AI.autorag('id').search({ query: '...' })` → `env.AI.aiSearch.get('id').search({ messages: [{ role: 'user', content: '...' }] })`
+   * - `env.AI.autorag('id').aiSearch(...)` → `env.AI.aiSearch.get('id').chatCompletions(...)`
+   *
+   * Note: The old API continues to work for backwards compatibility, but new projects should use AI Search.
+   *
+   * @see AiSearchAccountService
+   * @param autoragId Optional instance ID (omit for account-level operations)
+   */
   autorag(autoragId: string): AutoRAG;
   run<Name extends keyof AiModelList, Options extends AiOptions, InputOptions extends AiModelList[Name]["inputs"]>(
     model: Name,

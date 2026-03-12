@@ -466,63 +466,10 @@ class CompressionStreamBase: public kj::Refcounted,
   RingBuffer<PendingRead, 8> pendingReads;
 };
 
-// Uncompressed data goes in. Compressed data comes out.
-// TODO(cleanup): Once the autogate is removed, delete this class and merge CompressionStreamBase
-// and CompressionStreamImplV2 back into a single class.
 template <Context::Mode mode>
 class CompressionStreamImpl final: public CompressionStreamBase<mode> {
  public:
   explicit CompressionStreamImpl(kj::String format,
-      Context::ContextFlags flags,
-      kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
-      : CompressionStreamBase<mode>(kj::mv(format), flags, kj::mv(externalMemoryTarget)) {}
-
- protected:
-  void requireActive(kj::StringPtr errorMessage) override {
-    KJ_SWITCH_ONEOF(state) {
-      KJ_CASE_ONEOF(ended, Ended) {
-        JSG_FAIL_REQUIRE(Error, errorMessage);
-      }
-      KJ_CASE_ONEOF(exception, kj::Exception) {
-        kj::throwFatalException(kj::cp(exception));
-      }
-      KJ_CASE_ONEOF(open, Open) {
-        return;
-      }
-    }
-    KJ_UNREACHABLE;
-  }
-
-  void transitionToEnded() override {
-    state = Ended();
-  }
-
-  void transitionToErrored(kj::Exception&& reason) override {
-    state = kj::mv(reason);
-  }
-
-  void throwIfException() override {
-    KJ_IF_SOME(exception, state.template tryGet<kj::Exception>()) {
-      kj::throwFatalException(kj::cp(exception));
-    }
-  }
-
-  virtual bool isInTerminalState() override {
-    // Ended or Exception are both terminal states.
-    return state.template is<Ended>() || state.template is<kj::Exception>();
-  }
-
- private:
-  struct Ended {};
-  struct Open {};
-
-  kj::OneOf<Open, Ended, kj::Exception> state = Open();
-};
-
-template <Context::Mode mode>
-class CompressionStreamImplV2 final: public CompressionStreamBase<mode> {
- public:
-  explicit CompressionStreamImplV2(kj::String format,
       Context::ContextFlags flags,
       kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
       : CompressionStreamBase<mode>(kj::mv(format), flags, kj::mv(externalMemoryTarget)),
@@ -538,8 +485,9 @@ class CompressionStreamImplV2 final: public CompressionStreamBase<mode> {
   }
 
   void transitionToEnded() override {
-    // Use transitionFromTo to ensure we're in Open state before ending.
-    // This provides a clearer error if end() is called twice.
+    // If already in a terminal state (Ended or Exception), this is a no-op.
+    // This matches the V1 behavior where calling end() multiple times was allowed.
+    if (state.isTerminal()) return;
     auto result = state.template transitionFromTo<Open, Ended>();
     KJ_REQUIRE(result != kj::none, "Stream already ended or errored");
   }
@@ -633,11 +581,6 @@ kj::Rc<CompressionStreamBase<Context::Mode::COMPRESS>> createCompressionStreamIm
     kj::String format,
     Context::ContextFlags flags,
     kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget) {
-  // TODO(cleanup): Once the autogate is removed, we can delete CompressionStreamImpl
-  if (util::Autogate::isEnabled(util::AutogateKey::COMPRESSION_STREAM_USE_STATE_MACHINE)) {
-    return kj::rc<CompressionStreamImplV2<Context::Mode::COMPRESS>>(
-        kj::mv(format), flags, kj::mv(externalMemoryTarget));
-  }
   return kj::rc<CompressionStreamImpl<Context::Mode::COMPRESS>>(
       kj::mv(format), flags, kj::mv(externalMemoryTarget));
 }
@@ -646,11 +589,6 @@ kj::Rc<CompressionStreamBase<Context::Mode::DECOMPRESS>> createDecompressionStre
     kj::String format,
     Context::ContextFlags flags,
     kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget) {
-  // TODO(cleanup): Once the autogate is removed, we can delete CompressionStreamImpl
-  if (util::Autogate::isEnabled(util::AutogateKey::COMPRESSION_STREAM_USE_STATE_MACHINE)) {
-    return kj::rc<CompressionStreamImplV2<Context::Mode::DECOMPRESS>>(
-        kj::mv(format), flags, kj::mv(externalMemoryTarget));
-  }
   return kj::rc<CompressionStreamImpl<Context::Mode::DECOMPRESS>>(
       kj::mv(format), flags, kj::mv(externalMemoryTarget));
 }

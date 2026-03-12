@@ -9,6 +9,8 @@
 #include <workerd/util/capnp-mock.h>
 #include <workerd/util/test.h>
 
+#include <sqlite3.h>
+
 #include <kj/debug.h>
 #include <kj/test.h>
 
@@ -20,6 +22,10 @@ static constexpr kj::Date twoMs = 2 * kj::MILLISECONDS + kj::UNIX_EPOCH;
 static constexpr kj::Date threeMs = 3 * kj::MILLISECONDS + kj::UNIX_EPOCH;
 static constexpr kj::Date fourMs = 4 * kj::MILLISECONDS + kj::UNIX_EPOCH;
 static constexpr kj::Date fiveMs = 5 * kj::MILLISECONDS + kj::UNIX_EPOCH;
+// Used as the "current time" parameter for armAlarmHandler in tests.
+// Set to epoch (before all test alarm times) so existing tests aren't affected by
+// the overdue alarm check.
+static constexpr kj::Date testCurrentTime = kj::UNIX_EPOCH;
 
 template <typename T>
 kj::Promise<T> eagerlyReportExceptions(kj::Promise<T> promise, kj::SourceLocation location = {}) {
@@ -116,7 +122,7 @@ struct ActorSqliteTest final {
     }
   }
 
-  kj::Promise<void> commitCallback() {
+  kj::Promise<void> commitCallback(SpanParent) {
     auto [promise, fulfiller] = kj::newPromiseAndFulfiller<void>();
     calls.add(Call{kj::str("commit"), kj::mv(fulfiller)});
     return kj::mv(promise);
@@ -586,7 +592,7 @@ KJ_TEST("tells alarm handler to cancel when committed alarm is empty") {
   ActorSqliteTest test;
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     // We expect armAlarmHandler() to tell us to cancel the alarm.
     KJ_ASSERT(armResult.is<ActorCache::CancelAlarmHandler>());
     auto waitPromise = kj::mv(armResult.get<ActorCache::CancelAlarmHandler>().waitBeforeCancel);
@@ -612,7 +618,7 @@ KJ_TEST("tells alarm handler to reschedule when handler alarm is later than comm
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   // Request handler run at 2ms.  Expect cancellation with rescheduling.
-  auto armResult = test.actor.armAlarmHandler(twoMs, nullptr);
+  auto armResult = test.actor.armAlarmHandler(twoMs, nullptr, testCurrentTime);
   KJ_ASSERT(armResult.is<ActorSqlite::CancelAlarmHandler>());
   auto cancelResult = kj::mv(armResult.get<ActorSqlite::CancelAlarmHandler>());
 
@@ -636,7 +642,7 @@ KJ_TEST("tells alarm handler to reschedule when handler alarm is earlier than co
   KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
 
   // Expect that armAlarmHandler() tells caller to cancel after rescheduling completes.
-  auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+  auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
   KJ_ASSERT(armResult.is<ActorSqlite::CancelAlarmHandler>());
   auto cancelResult = kj::mv(armResult.get<ActorSqlite::CancelAlarmHandler>());
 
@@ -647,6 +653,32 @@ KJ_TEST("tells alarm handler to reschedule when handler alarm is earlier than co
   rescheduleFulfiller->fulfill();
   KJ_ASSERT(waitBeforeCancel.poll(test.ws));
   waitBeforeCancel.wait(test.ws);
+}
+
+KJ_TEST("runs overdue alarm immediately when local alarm time is in the past") {
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 2ms.
+  test.setAlarm(twoMs);
+  test.pollAndExpectCalls({"scheduleRun(2ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
+
+  // The local state says the alarm is due to fire at 2ms, but we're saying the AlarmManager has 1ms,
+  // usually this would result in a rescheduling of the alarm, but since our currentTime is 5ms, we
+  // will just run the alarm now since it's already overdue.
+  {
+    auto overdueCurrentTime = fiveMs;
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, overdueCurrentTime);
+
+    // Should run the handler immediately instead of canceling/rescheduling.
+    KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
+  }
+
+  // commit and delete the alarm after we drop the alarm handler (this is a deferred delete).
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({"scheduleRun(none)"})[0]->fulfill();
 }
 
 KJ_TEST("does not cancel handler when local db alarm state is later than scheduled alarm") {
@@ -661,7 +693,7 @@ KJ_TEST("does not cancel handler when local db alarm state is later than schedul
 
   test.setAlarm(twoMs);
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
   }
   test.pollAndExpectCalls({"commit"})[0]->fulfill();
@@ -680,7 +712,7 @@ KJ_TEST("does not cancel handler when local db alarm state is earlier than sched
 
   test.setAlarm(oneMs);
   {
-    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
   }
   test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
@@ -698,7 +730,7 @@ KJ_TEST("getAlarm() returns null during handler") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
     test.pollAndExpectCalls({});
 
@@ -719,7 +751,7 @@ KJ_TEST("alarm handler handle clears alarm when dropped with no writes") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
   }
   test.pollAndExpectCalls({"commit"})[0]->fulfill();
@@ -738,7 +770,7 @@ KJ_TEST("alarm deleter does not clear alarm when dropped with writes") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
     test.setAlarm(twoMs);
   }
@@ -759,7 +791,7 @@ KJ_TEST("can cancel deferred alarm deletion during handler") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
     test.actor.cancelDeferredAlarmDeletion();
   }
@@ -778,7 +810,7 @@ KJ_TEST("canceling deferred alarm deletion outside handler has no effect") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
   }
   test.pollAndExpectCalls({"commit"})[0]->fulfill();
@@ -803,7 +835,7 @@ KJ_TEST("canceling deferred alarm deletion outside handler edge case") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
   }
   test.actor.cancelDeferredAlarmDeletion();
@@ -825,7 +857,7 @@ KJ_TEST("canceling deferred alarm deletion is idempotent") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
     test.actor.cancelDeferredAlarmDeletion();
     test.actor.cancelDeferredAlarmDeletion();
@@ -846,7 +878,7 @@ KJ_TEST("alarm handler cleanup succeeds when output gate is broken") {
     test.pollAndExpectCalls({});
     KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
     auto deferredDelete = kj::mv(armResult.get<ActorSqlite::RunAlarmHandler>().deferredDelete);
 
@@ -893,7 +925,7 @@ KJ_TEST("handler alarm is not deleted when commit fails") {
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
 
     KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
@@ -1309,6 +1341,170 @@ KJ_TEST("calling deleteAll() during an implicit transaction preserves alarm stat
   KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
 }
 
+KJ_TEST("deleteAll with deleteAlarm option deletes alarm") {
+  // Tests that deleteAll() with deleteAlarm=true deletes the alarm along with KV data,
+  // instead of preserving the alarm as it does by default.
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 1ms.
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  // Call deleteAll() with deleteAlarm=true.
+  ActorCache::DeleteAllResults results = test.actor.deleteAll({}, nullptr, {.deleteAlarm = true});
+
+  // The alarm should now be deleted.
+  KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+
+  // Commit should include scheduling the alarm cancellation.
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({"scheduleRun(none)"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+
+  KJ_ASSERT(results.count.wait(test.ws) == 0);
+  KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+}
+
+KJ_TEST("deleteAll without deleteAlarm option preserves alarm") {
+  // Tests that deleteAll() without deleteAlarm (the default) preserves the alarm,
+  // which is the existing behavior.
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 1ms.
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  // Call deleteAll() without deleteAlarm (default behavior).
+  ActorCache::DeleteAllResults results = test.actor.deleteAll({}, nullptr);
+
+  // The alarm should be preserved.
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+
+  KJ_ASSERT(results.count.wait(test.ws) == 0);
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+}
+
+KJ_TEST("deleteAll with deleteAlarm during alarm handler cancels deferred delete") {
+  // Tests that calling deleteAll() with deleteAlarm=true while an alarm handler is running
+  // correctly deletes the alarm and cancels the deferred alarm deletion (haveDeferredDelete).
+  // When the handler's DeferredAlarmDeleter is dropped, it should NOT write a null alarm row
+  // since deleteAll already handled the deletion.
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 1ms.
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  {
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
+    KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
+
+    // During the handler, getAlarm() should return none (deferred delete is active).
+    KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+
+    // Call deleteAll() with deleteAlarm=true while the handler is running.
+    auto results = test.actor.deleteAll({}, nullptr, {.deleteAlarm = true});
+
+    // getAlarm() should still return none.
+    KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+
+    // Drop the DeferredAlarmDeleter (simulating handler success). Since deleteAll already
+    // cleared haveDeferredDelete, this should NOT write to the metadata table.
+  }
+
+  // The deleteAll commit should go through commitImpl(), which detects the alarm moved to none
+  // and schedules the cancellation.
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({"scheduleRun(none)"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+
+  KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+}
+
+KJ_TEST("deleteAll without deleteAlarm during alarm handler still has deferred delete") {
+  // Tests that calling deleteAll() without deleteAlarm while an alarm handler is running
+  // restores the alarm in metadata but leaves haveDeferredDelete active. When the handler
+  // finishes, the deferred deletion deletes the restored alarm.
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 1ms.
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  {
+    auto armResult = test.actor.armAlarmHandler(oneMs, nullptr, testCurrentTime);
+    KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
+
+    // During the handler, getAlarm() should return none (deferred delete is active).
+    KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+
+    // Call deleteAll() without deleteAlarm while the handler is running.
+    // This restores the alarm in metadata, but haveDeferredDelete is still true.
+    test.actor.deleteAll({}, nullptr);
+
+    // getAlarm() still returns none because haveDeferredDelete is still active.
+    KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+
+    // Drop the DeferredAlarmDeleter (simulating handler success). This triggers
+    // maybeDeleteDeferredAlarm() which deletes the restored alarm.
+  }
+
+  // The deleteAll commit goes first, then the deferred alarm deletion triggers its own commit
+  // with alarm scheduling.
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({"scheduleRun(none)"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+
+  KJ_ASSERT(expectSync(test.getAlarm()) == kj::none);
+}
+
+KJ_TEST("deleteAll deleteAlarm does not schedule alarm cancellation if setAlarm interleaves") {
+  ActorSqliteTest test;
+
+  // Initialize alarm state to 1ms.
+  test.setAlarm(oneMs);
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == oneMs);
+
+  // Start deleteAll with deleteAlarm=true and hold the commit.
+  test.actor.deleteAll({}, nullptr, {.deleteAlarm = true});
+  auto deleteAllCommit = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+
+  // While deleteAll commit is in-flight, set a later alarm.
+  test.setAlarm(twoMs);
+  auto setAlarmCommit = kj::mv(test.pollAndExpectCalls({"commit"})[0]);
+  test.pollAndExpectCalls({});
+  KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
+
+  // Completing the deleteAll commit should NOT schedule a cancel because setAlarm interleaved.
+  deleteAllCommit->fulfill();
+  test.pollAndExpectCalls({});
+
+  // Completing the setAlarm commit should schedule the new alarm time.
+  setAlarmCommit->fulfill();
+  test.pollAndExpectCalls({"scheduleRun(2ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({});
+
+  KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
+}
+
 KJ_TEST("rolling back transaction leaves alarm in expected state") {
   ActorSqliteTest test;
 
@@ -1340,7 +1536,7 @@ KJ_TEST("rolling back transaction leaves deferred alarm deletion in expected sta
   KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
 
     auto txn = test.actor.startTransaction();
@@ -1373,7 +1569,7 @@ KJ_TEST("committing transaction leaves deferred alarm deletion in expected state
   KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
 
     auto txn = test.actor.startTransaction();
@@ -1404,7 +1600,7 @@ KJ_TEST("rolling back nested transaction leaves deferred alarm deletion in expec
   KJ_ASSERT(expectSync(test.getAlarm()) == twoMs);
 
   {
-    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr);
+    auto armResult = test.actor.armAlarmHandler(twoMs, nullptr, testCurrentTime);
     KJ_ASSERT(armResult.is<ActorSqlite::RunAlarmHandler>());
 
     auto txn1 = test.actor.startTransaction();
@@ -2147,6 +2343,12 @@ KJ_TEST("unconfirmed setAlarm failure still breaks output gate") {
 
 KJ_TEST("sync() throws after critical error in explicit transaction") {
   ActorSqliteTest test({.monitorOutputGate = false});
+  auto heapLimit = [&]() {
+    auto row = test.db.run("PRAGMA hard_heap_limit");
+    return row.getInt(0);
+  }();
+  KJ_DBG(heapLimit);
+  KJ_DEFER(sqlite3_hard_heap_limit64(heapLimit););
 
   // Start an explicit transaction
   auto txn = test.actor.startTransaction();
@@ -2184,6 +2386,517 @@ KJ_TEST("sync() throws after critical error in explicit transaction") {
   // The transaction is now in a broken state due to the critical error.
   // Attempting to commit should fail.
   KJ_EXPECT_THROW_MESSAGE("broken", txn->commit());
+}
+
+KJ_TEST("allowUnconfirmed put in explicit transaction does not block output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Do an unconfirmed put within the transaction
+  txn->put(
+      kj::str("foo"), kj::heapArray(kj::str("bar").asBytes()), {.allowUnconfirmed = true}, nullptr);
+
+  // Gate still isn't blocked during the transaction, because we set `allowUnconfirmed`.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should still not be blocked during commit because all writes were unconfirmed
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify data was written
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("foo"))) == kj::str("bar").asBytes());
+}
+
+KJ_TEST("confirmed put in explicit transaction blocks output gate on commit") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Do a confirmed put (default behavior)
+  txn->put(kj::str("foo"), kj::heapArray(kj::str("bar").asBytes()), {.allowUnconfirmed = false},
+      nullptr);
+
+  // Gate should still not be blocked during the transaction - explicit txns only lock on commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Now the gate should be blocked because we're committing a confirmed write
+  KJ_ASSERT(!test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should unblock after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify data was written
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("foo"))) == kj::str("bar").asBytes());
+}
+
+KJ_TEST("mixed confirmed and unconfirmed puts in explicit transaction use output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Do an unconfirmed put followed by a confirmed put
+  txn->put(
+      kj::str("foo"), kj::heapArray(kj::str("bar").asBytes()), {.allowUnconfirmed = true}, nullptr);
+  txn->put(kj::str("baz"), kj::heapArray(kj::str("quux").asBytes()), {.allowUnconfirmed = false},
+      nullptr);
+
+  // Gate should still not be blocked during the transaction
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Since any write in the transaction needs confirmation, commit should use output gate
+  KJ_ASSERT(!test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should unblock after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Both writes should be committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("foo"))) == kj::str("bar").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("baz"))) == kj::str("quux").asBytes());
+}
+
+KJ_TEST("allowUnconfirmed delete in explicit transaction does not block output gate") {
+  ActorSqliteTest test;
+
+  // First set up some data
+  test.put("foo", "bar");
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should be unblocked after setup
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Perform an unconfirmed delete
+  expectSync(txn->delete_(kj::str("foo"), {.allowUnconfirmed = true}, nullptr));
+
+  // Gate still isn't blocked during the transaction
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should still not be blocked during commit because the delete was unconfirmed
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify data was deleted
+  KJ_ASSERT(expectSync(test.get("foo")) == kj::none);
+}
+
+KJ_TEST("allowUnconfirmed putMultiple in explicit transaction does not block output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Do an unconfirmed putMultiple
+  auto pairs = kj::heapArrayBuilder<ActorCacheOps::KeyValuePair>(2);
+  pairs.add(ActorCacheOps::KeyValuePair{kj::str("foo"), kj::heapArray(kj::str("bar").asBytes())});
+  pairs.add(ActorCacheOps::KeyValuePair{kj::str("baz"), kj::heapArray(kj::str("quux").asBytes())});
+  txn->put(pairs.finish(), {.allowUnconfirmed = true}, nullptr);
+
+  // Gate still isn't blocked during the transaction
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should still not be blocked during commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify data was written
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("foo"))) == kj::str("bar").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("baz"))) == kj::str("quux").asBytes());
+}
+
+KJ_TEST("allowUnconfirmed deleteMultiple in explicit transaction does not block output gate") {
+  ActorSqliteTest test;
+
+  // First set up some data
+  test.put("foo", "bar");
+  test.put("baz", "quux");
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should be unblocked after setup
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Perform an unconfirmed deleteMultiple
+  auto keys = kj::heapArrayBuilder<ActorCacheOps::Key>(2);
+  keys.add(kj::str("foo"));
+  keys.add(kj::str("baz"));
+  expectSync(txn->delete_(keys.finish(), {.allowUnconfirmed = true}, nullptr));
+
+  // Gate still isn't blocked during the transaction
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should still not be blocked during commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify data was deleted
+  KJ_ASSERT(expectSync(test.get("foo")) == kj::none);
+  KJ_ASSERT(expectSync(test.get("baz")) == kj::none);
+}
+
+KJ_TEST("allowUnconfirmed setAlarm in explicit transaction does not block output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Set an alarm with allowUnconfirmed
+  txn->setAlarm(oneMs, {.allowUnconfirmed = true}, nullptr);
+
+  // Gate still isn't blocked during the transaction
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should still not be blocked during commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the scheduleRun and commit
+  test.pollAndExpectCalls({"scheduleRun(1ms)"})[0]->fulfill();
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify alarm was set
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.getAlarm())) == oneMs);
+}
+
+KJ_TEST("nested transaction: unconfirmed child commit does not block output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start a parent transaction
+  auto parentTxn = test.actor.startTransaction();
+
+  // Do an unconfirmed put in the parent
+  parentTxn->put(kj::str("parent"), kj::heapArray(kj::str("data").asBytes()),
+      {.allowUnconfirmed = true}, nullptr);
+
+  {
+    // Start a nested child transaction
+    auto childTxn = test.actor.startTransaction();
+
+    // Do an unconfirmed put in the child
+    childTxn->put(kj::str("child"), kj::heapArray(kj::str("data").asBytes()),
+        {.allowUnconfirmed = true}, nullptr);
+
+    // Gate still isn't blocked
+    KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+    // Commit the child transaction
+    childTxn->commit();
+  }
+
+  // Gate should still not be blocked after child commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the parent transaction
+  parentTxn->commit();
+
+  // Gate should still not be blocked during parent commit because all writes were unconfirmed
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify both writes were committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("parent"))) == kj::str("data").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("child"))) == kj::str("data").asBytes());
+}
+
+KJ_TEST("nested transaction: confirmed child propagates to parent commit") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start a parent transaction with unconfirmed write
+  auto parentTxn = test.actor.startTransaction();
+  parentTxn->put(kj::str("parent"), kj::heapArray(kj::str("data").asBytes()),
+      {.allowUnconfirmed = true}, nullptr);
+
+  {
+    // Start a nested child transaction
+    auto childTxn = test.actor.startTransaction();
+
+    // Do a confirmed put in the child
+    childTxn->put(kj::str("child"), kj::heapArray(kj::str("data").asBytes()),
+        {.allowUnconfirmed = false}, nullptr);
+
+    // Gate still isn't blocked during the transaction
+    KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+    // Commit the child transaction - this should propagate someWriteConfirmed to parent
+    childTxn->commit();
+  }
+
+  // Gate should still not be blocked after child commit (no real commit yet)
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the parent transaction
+  parentTxn->commit();
+
+  // Now the gate should be blocked because the child had a confirmed write
+  KJ_ASSERT(!test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should unblock after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify both writes were committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("parent"))) == kj::str("data").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("child"))) == kj::str("data").asBytes());
+}
+
+KJ_TEST("nested transaction: confirmed parent with unconfirmed child blocks output gate") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start a parent transaction with confirmed write
+  auto parentTxn = test.actor.startTransaction();
+  parentTxn->put(kj::str("parent"), kj::heapArray(kj::str("data").asBytes()),
+      {.allowUnconfirmed = false}, nullptr);
+
+  {
+    // Start a nested child transaction
+    auto childTxn = test.actor.startTransaction();
+
+    // Do an unconfirmed put in the child
+    childTxn->put(kj::str("child"), kj::heapArray(kj::str("data").asBytes()),
+        {.allowUnconfirmed = true}, nullptr);
+
+    // Gate still isn't blocked during the transaction
+    KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+    // Commit the child transaction
+    childTxn->commit();
+  }
+
+  // Gate should still not be blocked after child commit
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the parent transaction
+  parentTxn->commit();
+
+  // Now the gate should be blocked because the parent had a confirmed write
+  KJ_ASSERT(!test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should unblock after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify both writes were committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("parent"))) == kj::str("data").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("child"))) == kj::str("data").asBytes());
+}
+
+KJ_TEST("nested transaction: deeply nested confirmed write propagates to root") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start a parent transaction with unconfirmed write
+  auto txn1 = test.actor.startTransaction();
+  txn1->put(kj::str("level1"), kj::heapArray(kj::str("data").asBytes()), {.allowUnconfirmed = true},
+      nullptr);
+
+  {
+    // Start a second level nested transaction with unconfirmed write
+    auto txn2 = test.actor.startTransaction();
+    txn2->put(kj::str("level2"), kj::heapArray(kj::str("data").asBytes()),
+        {.allowUnconfirmed = true}, nullptr);
+
+    {
+      // Start a third level nested transaction with confirmed write
+      auto txn3 = test.actor.startTransaction();
+      txn3->put(kj::str("level3"), kj::heapArray(kj::str("data").asBytes()),
+          {.allowUnconfirmed = false}, nullptr);
+
+      // Gate still isn't blocked during the transaction
+      KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+      // Commit level 3 - should propagate someWriteConfirmed to level 2
+      txn3->commit();
+    }
+
+    KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+    // Commit level 2 - should propagate someWriteConfirmed to level 1
+    txn2->commit();
+  }
+
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit level 1 (root transaction)
+  txn1->commit();
+
+  // Now the gate should be blocked because level 3 had a confirmed write
+  KJ_ASSERT(!test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should unblock after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify all writes were committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("level1"))) == kj::str("data").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("level2"))) == kj::str("data").asBytes());
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("level3"))) == kj::str("data").asBytes());
+}
+
+KJ_TEST("nested transaction: rollback resets someWriteConfirmed flag") {
+  ActorSqliteTest test;
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start a parent transaction with unconfirmed write
+  auto parentTxn = test.actor.startTransaction();
+  parentTxn->put(kj::str("parent"), kj::heapArray(kj::str("data").asBytes()),
+      {.allowUnconfirmed = true}, nullptr);
+
+  {
+    // Start a nested child transaction
+    auto childTxn = test.actor.startTransaction();
+
+    // Do a confirmed put in the child
+    childTxn->put(kj::str("child"), kj::heapArray(kj::str("data").asBytes()),
+        {.allowUnconfirmed = false}, nullptr);
+
+    // Gate still isn't blocked during the transaction
+    KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+    // Rollback the child transaction instead of committing
+    childTxn->rollback().wait(test.ws);
+  }
+
+  // Gate should still not be blocked
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Commit the parent transaction
+  parentTxn->commit();
+
+  // Gate should still not be blocked because child was rolled back
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Complete the commit
+  test.pollAndExpectCalls({"commit"})[0]->fulfill();
+
+  // Gate should still not be blocked after commit completes
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Verify only parent write was committed
+  KJ_ASSERT(KJ_ASSERT_NONNULL(expectSync(test.get("parent"))) == kj::str("data").asBytes());
+  KJ_ASSERT(expectSync(test.get("child")) == kj::none);
+}
+
+KJ_TEST("explicit transaction: commit failure breaks output gate even for unconfirmed writes") {
+  ActorSqliteTest test({.monitorOutputGate = false});
+
+  auto promise = test.gate.onBroken();
+
+  // Gate is currently not blocked.
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Start an explicit transaction
+  auto txn = test.actor.startTransaction();
+
+  // Do an unconfirmed put
+  txn->put(
+      kj::str("foo"), kj::heapArray(kj::str("bar").asBytes()), {.allowUnconfirmed = true}, nullptr);
+
+  // Commit the transaction
+  txn->commit();
+
+  // Gate should not be blocked yet because write was unconfirmed
+  KJ_ASSERT(test.gate.wait(nullptr).poll(test.ws));
+
+  // Reject the commit to simulate failure
+  test.pollAndExpectCalls({"commit"})[0]->reject(KJ_EXCEPTION(FAILED, "commit failed"));
+
+  // Gate should now be broken due to commit failure, even though write was unconfirmed
+  KJ_EXPECT_THROW_MESSAGE("commit failed", promise.wait(test.ws));
 }
 
 }  // namespace

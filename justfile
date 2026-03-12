@@ -56,7 +56,7 @@ stream-test *args:
 
 # e.g. just node-test zlib
 node-test test_name *args:
-  just stream-test //src/workerd/api/node/tests:{{test_name}}-nodejs-test {{args}}
+  just stream-test //src/workerd/api/node/tests:{{test_name}}-nodejs-test@ {{args}}
 
 # e.g. just wpt-test urlpattern
 wpt-test test_name:
@@ -122,9 +122,9 @@ update-reported-node-version:
   python3 tools/update_node_version.py src/workerd/api/node/node-version.h
 
 # called by rust-analyzer discoverConfig (quiet recipe with no output)
+# rust-analyzer doesn't like stderr output, redirect it to /dev/null
 @_rust-analyzer:
   rm -rf ./rust-project.json
-  # rust-analyzer doesn't like stderr output, redirect it to /dev/null
   bazel run @rules_rust//tools/rust_analyzer:discover_bazel_rust_project 2>/dev/null
 
 create-external:
@@ -133,17 +133,20 @@ create-external:
 bench-all:
   bazel query 'attr(tags, "[\[ ]google_benchmark[,\]]", //... + @capnp-cpp//...)' --output=label | xargs -I {} bazel run --config=benchmark {}
 
+lint: eslint
+
 eslint:
   just stream-test \
     //src/cloudflare:cloudflare@eslint \
     //src/node:node@eslint \
     //src/pyodide:pyodide_static@eslint \
-    //src/wpt:wpt-all@eslint \
+    //src/wpt:wpt-all@tsproject@eslint \
     //types:types_lib@eslint
 
+# Generate code coverage report (Linux only)
 coverage path="//...":
-  bazel coverage {{path}}
-  genhtml --branch-coverage --output coverage "$(bazel info output_path)/_coverage/_coverage_report.dat"
+  bazel coverage --config=coverage {{path}}
+  genhtml --branch-coverage --ignore-errors category --output coverage "$(bazel info output_path)/_coverage/_coverage_report.dat"
   open coverage/index.html
 
 profile path:

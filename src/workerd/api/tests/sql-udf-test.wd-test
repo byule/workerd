@@ -1,0 +1,32 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  services = [
+    (name = "main", worker = .mainWorker),
+    (name = "TEST_TMPDIR", disk = (writable = true)),
+  ],
+  # "--expose-gc" is needed for GC tests
+  v8Flags = ["--expose-gc"],
+);
+
+const mainWorker :Workerd.Worker = (
+  # "experimental" flag is needed to test sql.newFunction() and sql.newAggregate().
+  # "enable_weak_ref" is needed for FinalizationRegistry in GC tests.
+  compatibilityFlags = ["experimental", "nodejs_compat", "enable_weak_ref"],
+
+  modules = [
+    (name = "worker", esModule = embed "sql-udf-test.js"),
+  ],
+
+  durableObjectNamespaces = [
+    ( className = "UdfTestDO",
+      uniqueKey = "sql-udf-test-do-unique-key",
+      enableSql = true ),
+  ],
+
+  durableObjectStorage = (localDisk = "TEST_TMPDIR"),
+
+  bindings = [
+    (name = "ns", durableObjectNamespace = "UdfTestDO"),
+  ],
+);

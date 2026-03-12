@@ -44,7 +44,7 @@ struct SpanContext {
   # For Hibernate and Mark this would be the span under which they were emitted.
   # This is only empty if:
   #  1. This is an Onset event
-  #  2. We are not inherting any SpanContext. (e.g. this is a cross-account service binding or a new top-level invocation)
+  #  2. We are not inheriting any SpanContext. (e.g. this is a cross-account service binding or a new top-level invocation)
   info :union {
     empty @1 :Void;
     spanId @2 :UInt64;
@@ -176,6 +176,20 @@ struct Trace @0x8e8d911203762d34 {
     message @2 :Data;
   }
 
+  # Indicates how many tail stream events were dropped in total.
+  struct DroppedEvents {
+    count @0 :UInt32;
+  }
+
+  struct StreamDiagnosticsEvent {
+    # In the future, we plan to support several types of events here, for now only the dropped
+    # events diagnostic is supported.
+    diagnostic :union {
+      undefined @0 :Void;
+      droppedEvents @1 :DroppedEvents;
+    }
+  }
+
   truncated @24 :Bool;
   # Indicates that the trace was truncated due to reaching the maximum size limit.
 
@@ -295,6 +309,7 @@ struct Trace @0x8e8d911203762d34 {
       diagnosticChannelEvent @10 :DiagnosticChannelEvent;
       exception @11 :Exception;
       log @12 :Log;
+      streamDiagnostics @13 :StreamDiagnosticsEvent;
     }
   }
 }
@@ -777,11 +792,11 @@ interface EventDispatcher @0xf20697475ec1752d {
 interface WorkerdBootstrap {
   # Bootstrap interface exposed by workerd when serving Cap'n Proto RPC.
 
-  startEvent @0 () -> (dispatcher :EventDispatcher);
+  startEvent @0 (cfBlobJson :Text) -> (dispatcher :EventDispatcher);
   # Start a new event. Exactly one event should be delivered to the returned EventDispatcher.
   #
-  # TODO(someday): Pass cfBlobJson? Currently doesn't matter since the cf blob is only present for
-  #   HTTP requests which can be delivered over regular HTTP instead of capnp.
+  # If the event is an HTTP request, `cfBlobJson` optionally carries the JSON-encoded `request.cf`
+  # object. The dispatcher will pass it through to the worker via SubrequestMetadata.
 }
 
 interface WorkerdDebugPort {

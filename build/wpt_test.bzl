@@ -66,7 +66,7 @@ def wpt_test(name, wpt_directory, config, compat_date = "", compat_flags = [], a
         wpt_common = wpt_common,
         wpt_resources = wpt_resources,
         wpt_interfaces = wpt_interfaces,
-        compat_flags = compat_flags + ["experimental", "nodejs_compat", "unsupported_process_actual_platform"],
+        compat_flags = compat_flags + ["immutable_api_prototypes", "spec_compliant_property_attributes", "pedantic_wpt", "experimental", "nodejs_compat", "unsupported_process_actual_platform"],
     )
 
     data = [
@@ -198,7 +198,7 @@ def is_test_file(file):
         # into the main directory, and would need to manually be marked as skipAllTests
         return False
 
-    if ".tentative." in file.path:
+    if ".tentative." in file.path or "/tentative/" in file.path:
         # Tentative tests are for proposed features that are not yet standardized.
         # We skip these to avoid noise from unstable specifications.
         return False

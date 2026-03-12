@@ -243,11 +243,25 @@ jsg::BufferSource BufferUtil::concat(
   auto view = dest.asArrayPtr();
 
   for (auto& src: list) {
+    // Guard against resizable ArrayBuffers whose underlying buffer may have been
+    // resized by a getter during the array-unwrap phase, making the cached
+    // byteLength stale. Re-read the live ArrayBuffer byte length and clamp.
+    size_t effectiveSize = 0;
+    KJ_IF_SOME(abSize, src.underlyingArrayBufferSize(js)) {
+      auto offset = src.getOffset();
+      effectiveSize = kj::min(src.size(), abSize > offset ? abSize - offset : 0);
+    }
+
+    if (effectiveSize == 0) continue;
+    // NOTE: ptr.size() may exceed effectiveSize because BackingStore caches byteLength
+    // from construction time, not the live ArrayBuffer size. Always use effectiveSize
+    // (which reflects the re-validated live size) for copy bounds.
+
     auto ptr = src.asArrayPtr();
     if (src.size() == 0) continue;
     // The amount to copy is the lesser of the remaining space in the destination or
-    // the size of the chunk we're copying.
-    auto amountToCopy = kj::min(src.size(), view.size());
+    // the effective size of the chunk we're copying.
+    auto amountToCopy = kj::min(effectiveSize, view.size());
     view.first(amountToCopy).copyFrom(ptr.first(amountToCopy));
     view = view.slice(amountToCopy);
     // If there's no more space in the destination, we're done.
@@ -339,31 +353,40 @@ jsg::Optional<uint32_t> indexOfBuffer(jsg::Lock& js,
     EncodingValue encoding,
     bool isForward) {
   auto enc = static_cast<Encoding>(encoding);
-  auto optOffset = indexOfOffset(hayStack.size(), byteOffset, needle.size(), isForward);
+  // Round down to the nearest multiple of 2 in case of UCS2.
+  auto hayStackLength = enc == Encoding::UTF16LE ? hayStack.size() & ~1 : hayStack.size();
+  auto optOffset = indexOfOffset(hayStackLength, byteOffset, needle.size(), isForward);
 
   if (needle.size() == 0) return optOffset;
-  if (hayStack.size() == 0 || optOffset <= -1 ||
-      (isForward && needle.size() + optOffset > hayStack.size()) ||
-      needle.size() > hayStack.size()) {
+  if (hayStackLength == 0 || optOffset <= -1 ||
+      (isForward && needle.size() + optOffset > hayStackLength) || needle.size() > hayStackLength) {
     return kj::none;
   }
-
-  auto result = hayStack.size();
+  auto result = hayStackLength;
   if (enc == Encoding::UTF16LE) {
-    if (hayStack.size() < 2 || needle.size() < 2) {
+    if (hayStackLength < 2 || needle.size() < 2) {
       return kj::none;
     }
-    result = SearchString(reinterpret_cast<const uint16_t*>(hayStack.asChars().begin()),
-        hayStack.size() / 2,
-        reinterpret_cast<const uint16_t*>(needle.asArrayPtr().asChars().begin()), needle.size() / 2,
-        optOffset / 2, isForward);
+    // Copy haystack and needle to aligned buffers to avoid undefined behavior
+    // from unaligned uint16_t access (the data pointer may have an odd byte offset).
+    auto hayStackU16Len = hayStackLength / 2;
+    kj::SmallArray<uint16_t, 1024> alignedHayStack(hayStackU16Len);
+    alignedHayStack.asBytes().copyFrom(hayStack.first(hayStackLength));
+
+    auto needleLen = needle.size() & ~1;
+    auto needleU16Len = needleLen / 2;
+    kj::SmallArray<uint16_t, 1024> alignedNeedle(needleU16Len);
+    alignedNeedle.asBytes().copyFrom(needle.asArrayPtr().first(needleLen));
+
+    result = SearchString(alignedHayStack.begin(), hayStackU16Len, alignedNeedle.begin(),
+        needleU16Len, optOffset / 2, isForward);
     result *= 2;
   } else {
     result = SearchString(hayStack.asBytes().begin(), hayStack.size(),
         needle.asArrayPtr().asBytes().begin(), needle.size(), optOffset, isForward);
   }
 
-  if (result == hayStack.size()) return kj::none;
+  if (result == hayStackLength) return kj::none;
 
   return result;
 }
@@ -395,11 +418,16 @@ jsg::Optional<uint32_t> indexOfString(jsg::Lock& js,
   auto result = hayStackLength;
 
   if (enc == Encoding::UTF16LE) {
-    if (hayStack.size() < 2 || decodedNeedle.size() < 2) {
+    if (hayStackLength < 2 || decodedNeedle.size() < 2) {
       return kj::none;
     }
-    result = SearchString(reinterpret_cast<const uint16_t*>(hayStack.asChars().begin()),
-        hayStack.size() / 2,
+    // Copy haystack to an aligned buffer to avoid undefined behavior from
+    // unaligned uint16_t access (the data pointer may have an odd byte offset).
+    auto hayStackU16Len = hayStackLength / 2;
+    kj::SmallArray<uint16_t, 1024> alignedHayStack(hayStackU16Len);
+    alignedHayStack.asBytes().copyFrom(hayStack.first(hayStackLength));
+
+    result = SearchString(alignedHayStack.begin(), hayStackU16Len,
         reinterpret_cast<const uint16_t*>(decodedNeedle.asArrayPtr<char>().begin()),
         decodedNeedle.size() / 2, optOffset / 2, isForward);
     result *= 2;

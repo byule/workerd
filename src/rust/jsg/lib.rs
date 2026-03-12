@@ -9,10 +9,22 @@ use std::rc::Rc;
 
 use kj_rs::KjMaybe;
 
+pub mod feature_flags;
 pub mod modules;
 pub mod v8;
 mod wrappable;
 
+pub use feature_flags::FeatureFlags;
+pub use v8::BigInt64Array;
+pub use v8::BigUint64Array;
+pub use v8::Float32Array;
+pub use v8::Float64Array;
+pub use v8::Int8Array;
+pub use v8::Int16Array;
+pub use v8::Int32Array;
+pub use v8::Uint8Array;
+pub use v8::Uint16Array;
+pub use v8::Uint32Array;
 pub use v8::ffi::ExceptionType;
 pub use wrappable::FromJS;
 pub use wrappable::ToJS;
@@ -22,8 +34,11 @@ mod ffi {
     extern "Rust" {
         type Realm;
 
+        /// Create a fully-initialized Realm with feature flags.
+        /// `feature_flags_data` is canonical (single-segment, no segment table) Cap'n Proto
+        /// bytes produced by `capnp::canonicalize()` on the C++ side.
         #[expect(clippy::unnecessary_box_returns)]
-        unsafe fn realm_create(isolate: *mut Isolate) -> Box<Realm>;
+        unsafe fn realm_create(isolate: *mut Isolate, feature_flags_data: &[u8]) -> Box<Realm>;
     }
 
     unsafe extern "C++" {
@@ -44,6 +59,7 @@ fn get_resource_descriptor<R: Resource>() -> v8::ffi::ResourceDescriptor {
         constructor: KjMaybe::None,
         methods: Vec::new(),
         static_methods: Vec::new(),
+        static_constants: Vec::new(),
     };
 
     for m in R::members() {
@@ -70,6 +86,15 @@ fn get_resource_descriptor<R: Resource>() -> v8::ffi::ResourceDescriptor {
                     .push(v8::ffi::StaticMethodDescriptor {
                         name,
                         callback: callback as usize,
+                    });
+            }
+            Member::StaticConstant { name, value } => {
+                let ConstantValue::Number(number_value) = value;
+                descriptor
+                    .static_constants
+                    .push(v8::ffi::StaticConstantDescriptor {
+                        name,
+                        value: number_value,
                     });
             }
         }
@@ -286,7 +311,7 @@ impl From<ParseIntError> for Error {
 ///
 /// - `NonCoercible<String>` - only accepts JavaScript strings
 /// - `NonCoercible<bool>` - only accepts JavaScript booleans
-/// - `NonCoercible<f64>` - only accepts JavaScript numbers
+/// - `NonCoercible<Number>` - only accepts JavaScript numbers
 ///
 /// # Example
 ///
@@ -342,6 +367,146 @@ impl<T> Deref for NonCoercible<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.value
+    }
+}
+
+/// A wrapper type for JavaScript numbers (IEEE 754 double-precision floats).
+///
+/// `Number` represents JavaScript's `number` type, which is always a 64-bit
+/// floating-point value. This wrapper type is used instead of raw `f64` to
+/// distinguish between JavaScript numbers and Rust's `f64` type used for
+/// `Float64Array` elements.
+///
+/// # Usage
+///
+/// Use `Number` when you need to accept or return JavaScript numbers in your API:
+///
+/// ```ignore
+/// use jsg::Number;
+///
+/// #[jsg_method]
+/// pub fn add(&self, a: Number, b: Number) -> Number {
+///     Number::new(a.value() + b.value())
+/// }
+/// ```
+///
+/// # Type Mapping
+///
+/// | Rust Type | JavaScript Type |
+/// |-----------|-----------------|
+/// | `jsg::Number` | `number` |
+/// | `f64` | Used for `Float64Array` elements |
+/// | `Vec<f64>` | `Float64Array` |
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub struct Number {
+    value: f64,
+}
+
+impl Number {
+    /// The largest integer that can be represented exactly in JavaScript (2^53 - 1).
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER)
+    pub const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0; // 2^53 - 1
+
+    /// The smallest integer that can be represented exactly in JavaScript (-(2^53 - 1)).
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MIN_SAFE_INTEGER)
+    pub const MIN_SAFE_INTEGER: f64 = -9_007_199_254_740_991.0; // -(2^53 - 1)
+
+    /// Creates a new `Number` from an `f64` value.
+    #[inline]
+    pub fn new(value: f64) -> Self {
+        Self { value }
+    }
+
+    /// Returns the underlying `f64` value.
+    #[inline]
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// Consumes the wrapper and returns the inner `f64` value.
+    #[inline]
+    pub fn into_inner(self) -> f64 {
+        self.value
+    }
+
+    /// Determines whether the value is a finite number.
+    ///
+    /// Returns `true` if the value is finite (not `Infinity`, `-Infinity`, or `NaN`).
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/isFinite)
+    #[inline]
+    pub fn is_finite(&self) -> bool {
+        self.value.is_finite()
+    }
+
+    /// Determines whether the value is an integer.
+    ///
+    /// Returns `true` if the value is finite and has no fractional part.
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/isInteger)
+    #[inline]
+    #[expect(clippy::float_cmp)] // Exact comparison is correct here - we want trunc(x) == x
+    pub fn is_integer(&self) -> bool {
+        self.value.is_finite() && self.value.trunc() == self.value
+    }
+
+    /// Determines whether the value is `NaN`.
+    ///
+    /// This is more robust than the global `isNaN()` because it doesn't coerce
+    /// the value to a number first.
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/isNaN)
+    #[inline]
+    pub fn is_nan(&self) -> bool {
+        self.value.is_nan()
+    }
+
+    /// Determines whether the value is a safe integer.
+    ///
+    /// A safe integer is an integer that:
+    /// - Can be exactly represented as an IEEE-754 double precision number
+    /// - Has an IEEE-754 representation that cannot be the result of rounding any other integer
+    ///
+    /// Safe integers range from -(2^53 - 1) to 2^53 - 1, inclusive.
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/isSafeInteger)
+    #[inline]
+    pub fn is_safe_integer(&self) -> bool {
+        self.is_integer()
+            && self.value >= Self::MIN_SAFE_INTEGER
+            && self.value <= Self::MAX_SAFE_INTEGER
+    }
+}
+
+impl From<f64> for Number {
+    fn from(value: f64) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<Number> for f64 {
+    fn from(num: Number) -> Self {
+        num.value
+    }
+}
+
+impl From<i32> for Number {
+    fn from(value: i32) -> Self {
+        Self::new(f64::from(value))
+    }
+}
+
+impl From<u32> for Number {
+    fn from(value: u32) -> Self {
+        Self::new(f64::from(value))
+    }
+}
+
+impl std::fmt::Display for Number {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.value)
     }
 }
 
@@ -480,8 +645,19 @@ impl Lock {
         todo!()
     }
 
-    fn realm(&mut self) -> &mut Realm {
+    pub(crate) fn realm(&mut self) -> &mut Realm {
         unsafe { &mut *crate::ffi::realm_from_isolate(self.isolate().as_ffi()) }
+    }
+
+    /// Returns the current worker's compatibility flags reader.
+    ///
+    /// ```ignore
+    /// if lock.feature_flags().get_node_js_compat() {
+    ///     // Node.js compatibility behavior
+    /// }
+    /// ```
+    pub fn feature_flags(&mut self) -> compatibility_date_capnp::compatibility_flags::Reader<'_> {
+        self.realm().feature_flags.reader()
     }
 
     /// Throws an error as a V8 exception.
@@ -582,6 +758,41 @@ pub trait Type: Sized {
     fn is_exact(value: &v8::Local<v8::Value>) -> bool;
 }
 
+/// Represents a constant value that can be exposed to JavaScript.
+pub enum ConstantValue {
+    Number(f64),
+}
+
+macro_rules! impl_constant_value_from_lossless {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for ConstantValue {
+                fn from(v: $t) -> Self {
+                    Self::Number(f64::from(v))
+                }
+            }
+        )*
+    };
+}
+
+impl_constant_value_from_lossless!(i8, i16, i32, u8, u16, u32, f32, f64);
+
+// i64/u64 can lose precision in f64 (52-bit mantissa), but JavaScript numbers are
+// always f64 so this is inherent to the language boundary.
+impl From<i64> for ConstantValue {
+    #[expect(clippy::cast_precision_loss)]
+    fn from(v: i64) -> Self {
+        Self::Number(v as f64)
+    }
+}
+
+impl From<u64> for ConstantValue {
+    #[expect(clippy::cast_precision_loss)]
+    fn from(v: u64) -> Self {
+        Self::Number(v as f64)
+    }
+}
+
 pub enum Member {
     Constructor {
         callback: unsafe extern "C" fn(*mut v8::ffi::FunctionCallbackInfo),
@@ -598,6 +809,10 @@ pub enum Member {
     StaticMethod {
         name: String,
         callback: unsafe extern "C" fn(*mut v8::ffi::FunctionCallbackInfo),
+    },
+    StaticConstant {
+        name: String,
+        value: ConstantValue,
     },
 }
 
@@ -726,14 +941,17 @@ pub unsafe fn drop_resource<R: Resource>(_isolate: *mut ffi::Isolate, this: *mut
 pub struct Realm {
     isolate: v8::IsolatePtr,
     resources: Vec<*mut ResourceState>,
+    /// Parsed `CompatibilityFlags` capnp message, initialized at construction.
+    feature_flags: FeatureFlags,
 }
 
 impl Realm {
-    /// Creates a new Realm from a V8 isolate.
-    pub fn from_isolate(isolate: v8::IsolatePtr) -> Self {
+    /// Creates a new Realm with its feature flags.
+    pub fn new(isolate: v8::IsolatePtr, feature_flags: FeatureFlags) -> Self {
         Self {
             isolate,
             resources: Vec::new(),
+            feature_flags,
         }
     }
 
@@ -778,6 +996,7 @@ impl Drop for Realm {
 }
 
 #[expect(clippy::unnecessary_box_returns)]
-unsafe fn realm_create(isolate: *mut v8::ffi::Isolate) -> Box<Realm> {
-    unsafe { Box::new(Realm::from_isolate(v8::IsolatePtr::from_ffi(isolate))) }
+unsafe fn realm_create(isolate: *mut v8::ffi::Isolate, feature_flags_data: &[u8]) -> Box<Realm> {
+    let feature_flags = FeatureFlags::from_bytes(feature_flags_data);
+    unsafe { Box::new(Realm::new(v8::IsolatePtr::from_ffi(isolate), feature_flags)) }
 }

@@ -192,16 +192,37 @@ struct GeneratorContext: public Object, public ContextGlobal {
     generator.next(js);
   }
 
+  void generatorReturnNotCallable(Lock& js, Generator<kj::String> generator) {
+    // Per the GetMethod spec, if the 'return' property exists on the iterator
+    // but is not callable, calling return_() should throw a TypeError.
+    generator.return_(js);
+  }
+
+  void asyncGeneratorReturnNotCallable(Lock& js, AsyncGenerator<kj::String> generator) {
+    // Per the GetMethod spec, if the 'return' property exists on the async iterator
+    // but is not callable, calling return_() should produce a rejected promise with
+    // a TypeError.
+    bool gotRejection = false;
+    generator.return_(js).catch_(js, [&gotRejection](jsg::Lock& js, jsg::Value exception) {
+      gotRejection = true;
+      return kj::Maybe<kj::String>(kj::none);
+    });
+    js.runMicrotasks();
+    KJ_ASSERT(gotRejection);
+  }
+
   JSG_RESOURCE_TYPE(GeneratorContext) {
     JSG_METHOD(generatorTest);
     JSG_METHOD(generatorErrorTest);
     JSG_METHOD(sequenceOfSequenceTest);
     JSG_METHOD(generatorWrongType);
+    JSG_METHOD(generatorReturnNotCallable);
     JSG_METHOD(asyncGeneratorTest);
     JSG_METHOD(asyncGeneratorErrorTest);
     JSG_METHOD(manualAsyncGeneratorTest);
     JSG_METHOD(manualAsyncGeneratorTestEarlyReturn);
     JSG_METHOD(manualAsyncGeneratorTestThrow);
+    JSG_METHOD(asyncGeneratorReturnNotCallable);
   }
 };
 JSG_DECLARE_ISOLATE_TYPE(GeneratorIsolate, GeneratorContext, GeneratorContext::Test);
@@ -224,6 +245,14 @@ KJ_TEST("Generator works") {
 
   e.expectEval("generatorWrongType(['a'])", "throws",
       "TypeError: Incorrect type: the provided value is not of type 'Test'.");
+
+  // Per the GetMethod spec, if the 'return' property exists but is not callable,
+  // calling return_() should throw a TypeError.
+  e.expectEval("var iter = { [Symbol.iterator]() { return this; }, "
+               "next() { return { value: 'a', done: false }; }, "
+               "return: 42 }; "
+               "generatorReturnNotCallable(iter)",
+      "throws", "TypeError: Property 'return' is not a function");
 }
 
 KJ_TEST("AsyncGenerator works") {
@@ -245,6 +274,14 @@ KJ_TEST("AsyncGenerator works") {
 
   // e.expectEval("manualAsyncGeneratorTestThrow(async function* foo() { yield 'a'; yield 'b'; }())",
   //     "undefined", "undefined");
+
+  // Per the GetMethod spec, if the 'return' property exists but is not callable,
+  // calling return_() should produce a rejected promise with a TypeError.
+  e.expectEval("var iter = { [Symbol.asyncIterator]() { return this; }, "
+               "next() { return Promise.resolve({ value: 'a', done: false }); }, "
+               "return: 42 }; "
+               "asyncGeneratorReturnNotCallable(iter)",
+      "undefined", "undefined");
 }
 
 }  // namespace

@@ -25,16 +25,30 @@ export default {
     replace: removeUseCapture,
   },
   'Close-1005.any.js': {
-    comment:
-      'workerd throws TypeError instead of InvalidAccessError for close(1005), test hangs',
-    disabledTests: true,
+    replace: (code: string): string => {
+      code = removeUseCapture(code);
+      // The test expects close(1005) to throw, leaving the WebSocket open.
+      // In workerd, the open connection's read loop is registered as a
+      // waitUntil task that keeps the IoContext alive indefinitely.
+      // Add a cleanup to close the WebSocket when the test completes so the
+      // connection is properly shut down.
+      return code.replace(
+        'var isOpenCalled = false;',
+        'var isOpenCalled = false;\ntest.add_cleanup(function() { wsocket.close(); });'
+      );
+    },
   },
   'Close-2999-reason.any.js': {
-    comment: 'workerd does not throw INVALID_ACCESS_ERR for close(2999)',
-    expectedFailures: [
-      'Create WebSocket - Close the Connection - close(2999, reason) - INVALID_ACCESS_ERR is thrown',
-    ],
-    replace: removeUseCapture,
+    replace: (code: string): string => {
+      code = removeUseCapture(code);
+      // The test expects close(2999) to throw, leaving the WebSocket open.
+      // Add a cleanup to close the WebSocket when the test completes so the
+      // connection is properly shut down.
+      return code.replace(
+        'var wsocket = CreateWebSocket(false, false);',
+        'var wsocket = CreateWebSocket(false, false);\ntest.add_cleanup(function() { wsocket.close(); });'
+      );
+    },
   },
   'Close-3000-reason.any.js': {
     replace: removeUseCapture,
@@ -46,19 +60,31 @@ export default {
     replace: removeUseCapture,
   },
   'Close-Reason-124Bytes.any.js': {
-    comment: 'workerd does not throw SYNTAX_ERR for reason > 123 bytes',
-    expectedFailures: [
-      "Create WebSocket - Close the Connection - close(code, 'reason more than 123 bytes') - SYNTAX_ERR is thrown",
-    ],
-    replace: removeUseCapture,
+    replace: (code: string): string => {
+      code = removeUseCapture(code);
+      // The test expects close(1000, longReason) to throw SYNTAX_ERR, leaving
+      // the WebSocket still open. Add a cleanup to close the WebSocket when the
+      // test completes so the connection is properly shut down.
+      return code.replace(
+        'var isOpenCalled = false;',
+        'var isOpenCalled = false;\ntest.add_cleanup(function() { wsocket.close(); });'
+      );
+    },
   },
   'Close-delayed.any.js': {
     replace: removeUseCapture,
   },
   'Close-onlyReason.any.js': {
-    comment:
-      'workerd throws TypeError instead of INVALID_ACCESS_ERR for close(undefined, reason), test hangs',
-    disabledTests: true,
+    replace: (code: string): string => {
+      code = removeUseCapture(code);
+      // The test expects close("reason") to throw, leaving the WebSocket open.
+      // Add a cleanup to close the WebSocket when the test completes so the
+      // connection is properly shut down.
+      return code.replace(
+        'var wsocket = CreateWebSocket(false, false);',
+        'var wsocket = CreateWebSocket(false, false);\ntest.add_cleanup(function() { wsocket.close(); });'
+      );
+    },
   },
   'Close-readyState-Closed.any.js': {
     replace: removeUseCapture,
@@ -67,29 +93,15 @@ export default {
     replace: removeUseCapture,
   },
   'Close-reason-unpaired-surrogates.any.js': {
-    comment: 'workerd handles unpaired surrogates differently',
-    expectedFailures: [
-      'Create WebSocket - Close the Connection - close(reason with unpaired surrogates) - connection should get closed',
-    ],
     replace: removeUseCapture,
   },
   'Close-server-initiated-close.any.js': {
-    comment:
-      'readyState is CLOSING (2) instead of CLOSED (3) when close event fires',
-    expectedFailures: [
-      'Create WebSocket - Server initiated Close - Client sends back a CLOSE - readyState should be in CLOSED state and wasClean is TRUE - Connection should be closed',
-    ],
     replace: removeUseCapture,
   },
   'Close-undefined.any.js': {
     replace: removeUseCapture,
   },
-  'Create-asciiSep-protocol-string.any.js': {
-    comment: 'Error name is SyntaxError instead of SYNTAX_ERR',
-    expectedFailures: [
-      'Create WebSocket - Pass a valid URL and a protocol string with an ascii separator character - SYNTAX_ERR is thrown',
-    ],
-  },
+  'Create-asciiSep-protocol-string.any.js': {},
   'Create-blocked-port.any.js': {
     comment: 'Port blocking works differently in workerd',
     disabledTests: true,
@@ -115,22 +127,12 @@ export default {
       'Create WebSocket - Pass a non absolute URL: 123',
     ],
   },
-  'Create-nonAscii-protocol-string.any.js': {
-    comment: 'Error name is SyntaxError instead of SYNTAX_ERR',
-    expectedFailures: [
-      'Create WebSocket - Pass a valid URL and a protocol string with non-ascii values - SYNTAX_ERR is thrown',
-    ],
-  },
+  'Create-nonAscii-protocol-string.any.js': {},
   'Create-on-worker-shutdown.any.js': {
     comment: 'Worker shutdown behavior is different in workerd',
     disabledTests: true,
   },
-  'Create-protocol-with-space.any.js': {
-    comment: 'Error name is SyntaxError instead of SYNTAX_ERR',
-    expectedFailures: [
-      'Create WebSocket - Pass a valid URL and a protocol string with a space in it - SYNTAX_ERR is thrown',
-    ],
-  },
+  'Create-protocol-with-space.any.js': {},
   'Create-protocols-repeated-case-insensitive.any.js': {
     comment:
       'workerd does not throw for case-insensitive duplicate protocols (allows "Echo" and "echo")',
@@ -138,25 +140,13 @@ export default {
       'Create WebSocket - Pass a valid URL and an array of protocol strings with repeated values but different case - SYNTAX_ERR is thrown',
     ],
   },
-  'Create-protocols-repeated.any.js': {
-    comment: 'Error name is SyntaxError instead of SYNTAX_ERR',
-    expectedFailures: [
-      'Create WebSocket - Pass a valid URL and an array of protocol strings with repeated values - SYNTAX_ERR is thrown',
-    ],
-  },
-  'Create-url-with-space.any.js': {
-    comment: 'Error name is SyntaxError instead of SYNTAX_ERR',
-    expectedFailures: [
-      'Create WebSocket - Pass a URL with a space - SYNTAX_ERR should be thrown',
-    ],
-  },
+  'Create-protocols-repeated.any.js': {},
+  'Create-url-with-space.any.js': {},
   'Create-valid-url-array-protocols.any.js': {
     replace: removeUseCapture,
   },
   'Create-valid-url-binaryType-blob.any.js': {
-    comment:
-      'workerd WebSocket binaryType defaults to "arraybuffer", not "blob"; test hangs',
-    disabledTests: true,
+    replace: removeUseCapture,
   },
   'Create-valid-url-protocol-empty.any.js': {
     replace: removeUseCapture,
@@ -184,7 +174,8 @@ export default {
     disabledTests: true,
   },
   'Send-before-open.any.js': {
-    comment: 'Error name is InvalidStateError instead of INVALID_STATE_ERR',
+    comment:
+      'workerd throws TypeError instead of InvalidStateError DOMException for send() before open',
     expectedFailures: [
       'Send data on a WebSocket before connection is opened - INVALID_STATE_ERR is returned',
     ],
@@ -290,6 +281,11 @@ export default {
     comment: 'Back/forward cache tests are browser-specific',
     omittedTests: true,
   },
+  'back-forward-cache-with-open-websocket-connection-and-close-it-in-pagehide.window.js':
+    {
+      comment: 'Back/forward cache tests are browser-specific',
+      omittedTests: true,
+    },
   'back-forward-cache-with-open-websocket-connection.window.js': {
     comment: 'Back/forward cache tests are browser-specific',
     omittedTests: true,
@@ -299,23 +295,13 @@ export default {
     disabledTests: true,
   },
   'binaryType-wrong-value.any.js': {
-    comment: 'binaryType is undefined instead of blob in workerd; test hangs',
-    disabledTests: true,
+    replace: removeUseCapture,
   },
   'bufferedAmount-unchanged-by-sync-xhr.any.js': {
     comment: 'Synchronous XHR is not supported in Workers',
     omittedTests: true,
   },
   'close-invalid.any.js': {
-    comment: 'workerd does not throw errors for invalid close codes',
-    expectedFailures: [
-      '0 on a websocket',
-      '500 on a websocket',
-      'NaN on a websocket',
-      'String on a websocket',
-      'null on a websocket',
-      '2**16+1000 on a websocket',
-    ],
     replace: removeUseCapture,
   },
   'constants.sub.js': {},
@@ -334,65 +320,24 @@ export default {
     ],
   },
   'idlharness.any.js': {
-    comment: 'TODO: Investigate this',
+    comment:
+      'Some interface/attribute tests still fail due to event handler and inherited property checks',
     expectedFailures: [
       'WebSocket interface: existence and properties of interface object',
-      'WebSocket interface object length',
-      'WebSocket interface object name',
-      'WebSocket interface: existence and properties of interface prototype object',
-      'WebSocket interface: existence and properties of interface prototype object\'s "constructor" property',
-      "WebSocket interface: existence and properties of interface prototype object's @@unscopables property",
-      'WebSocket interface: attribute url',
-      'WebSocket interface: constant CONNECTING on interface object',
-      'WebSocket interface: constant CONNECTING on interface prototype object',
-      'WebSocket interface: constant OPEN on interface object',
-      'WebSocket interface: constant OPEN on interface prototype object',
-      'WebSocket interface: constant CLOSING on interface object',
-      'WebSocket interface: constant CLOSING on interface prototype object',
-      'WebSocket interface: constant CLOSED on interface object',
-      'WebSocket interface: constant CLOSED on interface prototype object',
-      'WebSocket interface: attribute readyState',
       'WebSocket interface: attribute bufferedAmount',
       'WebSocket interface: attribute onopen',
       'WebSocket interface: attribute onerror',
       'WebSocket interface: attribute onclose',
-      'WebSocket interface: attribute extensions',
-      'WebSocket interface: attribute protocol',
-      'WebSocket interface: operation close(optional unsigned short, optional USVString)',
       'WebSocket interface: attribute onmessage',
-      'WebSocket interface: attribute binaryType',
-      'WebSocket interface: operation send((BufferSource or Blob or USVString))',
-      'WebSocket must be primary interface of new WebSocket("ws://invalid")',
-      'Stringification of new WebSocket("ws://invalid")',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "url" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "CONNECTING" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "OPEN" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "CLOSING" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "CLOSED" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "readyState" with the proper type',
       'WebSocket interface: new WebSocket("ws://invalid") must inherit property "bufferedAmount" with the proper type',
       'WebSocket interface: new WebSocket("ws://invalid") must inherit property "onopen" with the proper type',
       'WebSocket interface: new WebSocket("ws://invalid") must inherit property "onerror" with the proper type',
       'WebSocket interface: new WebSocket("ws://invalid") must inherit property "onclose" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "extensions" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "protocol" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "close(optional unsigned short, optional USVString)" with the proper type',
-      'WebSocket interface: calling close(optional unsigned short, optional USVString) on new WebSocket("ws://invalid") with too few arguments must throw TypeError',
       'WebSocket interface: new WebSocket("ws://invalid") must inherit property "onmessage" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "binaryType" with the proper type',
-      'WebSocket interface: new WebSocket("ws://invalid") must inherit property "send((BufferSource or Blob or USVString))" with the proper type',
-      'WebSocket interface: calling send((BufferSource or Blob or USVString)) on new WebSocket("ws://invalid") with too few arguments must throw TypeError',
       'CloseEvent interface: existence and properties of interface object',
-      'CloseEvent interface object length',
-      'CloseEvent interface object name',
-      'CloseEvent interface: existence and properties of interface prototype object',
-      'CloseEvent interface: existence and properties of interface prototype object\'s "constructor" property',
-      "CloseEvent interface: existence and properties of interface prototype object's @@unscopables property",
       'CloseEvent interface: attribute wasClean',
       'CloseEvent interface: attribute code',
       'CloseEvent interface: attribute reason',
-      'CloseEvent must be primary interface of new CloseEvent("close")',
-      'Stringification of new CloseEvent("close")',
       'CloseEvent interface: new CloseEvent("close") must inherit property "wasClean" with the proper type',
       'CloseEvent interface: new CloseEvent("close") must inherit property "code" with the proper type',
       'CloseEvent interface: new CloseEvent("close") must inherit property "reason" with the proper type',
@@ -423,34 +368,5 @@ export default {
   },
   'send-many-64K-messages-with-backpressure.any.js': {
     replace: removeUseCapture,
-  },
-  // WebSocketStream is a tentative API and not yet implemented
-  'stream/tentative/abort.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/backpressure-receive.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/backpressure-send.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/close.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/constructor.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/remote-close.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
-  },
-  'stream/tentative/websocket-error.any.js': {
-    comment: 'WebSocketStream is not yet implemented',
-    omittedTests: true,
   },
 } satisfies TestRunnerConfig;

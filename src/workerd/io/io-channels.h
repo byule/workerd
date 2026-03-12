@@ -56,8 +56,10 @@ class TimerChannel {
   // Call each time control enters the isolate to set up the clock.
   virtual void syncTime() = 0;
 
-  // Return the current time.
-  virtual kj::Date now() = 0;
+  // Return the current time. `nextTimeout` is the time at which the next setTimeout() callback
+  // is scheduled; implementations performing Spectre mitigations should clamp to this value so
+  // that Date.now() never goes backwards or reveals timing side channels.
+  virtual kj::Date now(kj::Maybe<kj::Date> nextTimeout = kj::none) = 0;
 
   // Returns a promise that resolves once `now() >= when`.
   virtual kj::Promise<void> atTime(kj::Date when) = 0;
@@ -103,7 +105,7 @@ class IoChannelFactory {
     kj::Maybe<kj::String> cfBlobJson;
 
     // Specifies the parent span for the subrequest for tracing purposes.
-    TraceParentContext tracing = TraceParentContext(nullptr, nullptr);
+    SpanParent parentSpan = SpanParent(nullptr);
 
     // Serialized JSON value to pass in ew_compat field of control header to FL. If this subrequest
     // does not go directly to FL, this value is ignored. Flags marked with `$neededByFl` in
@@ -112,6 +114,18 @@ class IoChannelFactory {
 
     // Timestamp for when a subrequest is started. (ms since the Unix Epoch)
     double startTime = dateNow();
+  };
+
+  // Parameters that can influence the version of a worker that is used to serve a subrequest.
+  struct VersionRequest {
+    // Request a version within the given cohort.
+    kj::Maybe<kj::String> cohort;
+
+    VersionRequest clone() const {
+      return {
+        .cohort = cohort.map([](const kj::String& s) { return kj::str(s); }),
+      };
+    }
   };
 
   virtual kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) = 0;
@@ -192,12 +206,13 @@ class IoChannelFactory {
   // The reason to use this instead is when the channel is not necessarily going to be used to
   // start a subrequest immediately, but instead is going to be passed around as a capability.
   //
-  // `props` can only be specified if this is a loopback channel (i.e. from ctx.exports). For any
-  // other channel, it will throw.
+  // `props` and `versionRequest` can only be specified if this is a loopback channel (i.e. from
+  // ctx.exports). For any other channel, they will throw.
   //
   // TODO(cleanup): Consider getting rid of `startSubrequest()` in favor of this.
-  virtual kj::Own<SubrequestChannel> getSubrequestChannel(
-      uint channel, kj::Maybe<Frankenvalue> props = kj::none) = 0;
+  virtual kj::Own<SubrequestChannel> getSubrequestChannel(uint channel,
+      kj::Maybe<Frankenvalue> props = kj::none,
+      kj::Maybe<VersionRequest> versionRequest = kj::none) = 0;
 
   // Stub for a remote actor. Allows sending requests to the actor.
   class ActorChannel: public SubrequestChannel {
@@ -222,7 +237,8 @@ class IoChannelFactory {
       ActorGetMode mode,
       bool enableReplicaRouting,
       ActorRoutingMode routingMode,
-      SpanParent parentSpan) = 0;
+      SpanParent parentSpan,
+      kj::Maybe<ActorVersion> version) = 0;
 
   // Get an actor stub from the given namespace for the actor with the given name.
   virtual kj::Own<ActorChannel> getColoLocalActor(

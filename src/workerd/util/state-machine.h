@@ -4,6 +4,13 @@
 
 #pragma once
 
+// MSVC uses a different attribute name for no_unique_address
+#if _MSC_VER
+#define WD_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#else
+#define WD_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+
 // State Machine Abstraction built on kj::OneOf.
 // TODO(later): If this proves useful, consider moving it into kj itself as there
 // are no workerd-specific dependencies.
@@ -528,14 +535,14 @@ struct FilterStates_<> {
 
 template <typename First, typename... Rest>
 struct FilterStates_<First, Rest...> {
-  using RestFiltered = typename FilterStates_<Rest...>::Type;
+  using RestFiltered = FilterStates_<Rest...>::Type;
   using Type = std::conditional_t<isSpec<First>,
       RestFiltered,
       decltype(std::tuple_cat(kj::instance<std::tuple<First>>(), kj::instance<RestFiltered>()))>;
 };
 
 template <typename... Ts>
-using FilterStates = typename FilterStates_<Ts...>::Type;
+using FilterStates = FilterStates_<Ts...>::Type;
 
 // Convert tuple to kj::OneOf
 template <typename Tuple>
@@ -547,7 +554,7 @@ struct TupleToOneOf_<std::tuple<Ts...>> {
 };
 
 template <typename Tuple>
-using TupleToOneOf = typename TupleToOneOf_<Tuple>::Type;
+using TupleToOneOf = TupleToOneOf_<Tuple>::Type;
 
 // Generic spec finder - finds the first type matching a predicate
 template <template <typename> class Pred, typename... Ts>
@@ -607,7 +614,7 @@ struct Empty {};
 // Helper to extract ::Type from a spec, or PlaceholderType if spec is void
 template <typename Spec>
 struct ExtractSpecType_ {
-  using Type = typename Spec::Type;
+  using Type = Spec::Type;
 };
 
 template <>
@@ -616,7 +623,7 @@ struct ExtractSpecType_<void> {
 };
 
 template <typename Spec>
-using ExtractSpecType = typename ExtractSpecType_<Spec>::Type;
+using ExtractSpecType = ExtractSpecType_<Spec>::Type;
 
 // Generic spec counter using fold expression
 template <template <typename> class Pred, typename... Ts>
@@ -775,10 +782,10 @@ template <typename... Args>
 class StateMachine {
  public:
   // Extract specs from Args
-  using TerminalSpec = typename _::FindTerminalStatesSpec<Args...>::Type;
-  using ErrorSpec = typename _::FindErrorStateSpec<Args...>::Type;
-  using ActiveSpec = typename _::FindActiveStateSpec<Args...>::Type;
-  using PendingSpec = typename _::FindPendingStatesSpec<Args...>::Type;
+  using TerminalSpec = _::FindTerminalStatesSpec<Args...>::Type;
+  using ErrorSpec = _::FindErrorStateSpec<Args...>::Type;
+  using ActiveSpec = _::FindActiveStateSpec<Args...>::Type;
+  using PendingSpec = _::FindPendingStatesSpec<Args...>::Type;
 
   // Filter out specs to get actual states
   using StatesTuple = _::FilterStates<Args...>;
@@ -1664,8 +1671,8 @@ class StateMachine {
 
   // Pending state support (only allocated when HAS_PENDING is true)
   // Using _::Empty instead of char for proper [[no_unique_address]] optimization
-  [[no_unique_address]] std::conditional_t<HAS_PENDING, StateUnion, _::Empty> pendingState{};
-  [[no_unique_address]] std::conditional_t<HAS_PENDING, uint32_t, _::Empty> operationCount{};
+  WD_NO_UNIQUE_ADDRESS std::conditional_t<HAS_PENDING, StateUnion, _::Empty> pendingState{};
+  WD_NO_UNIQUE_ADDRESS std::conditional_t<HAS_PENDING, uint32_t, _::Empty> operationCount{};
 
   void requireUnlocked() const {
     KJ_REQUIRE(transitionLockCount == 0,
